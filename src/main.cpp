@@ -3,6 +3,7 @@
 #include "real_api_client.h"
 #include "order_book.h"
 #include "quote_engine.h"
+#include "ws_market_feed.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -75,8 +76,8 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage:" << std::endl;
         std::cerr << "  mm_bot <config.json>              # Full market maker mode" << std::endl;
-        std::cerr << "  mm_bot --monitor <token_id>       # Monitor order book only" << std::endl;
-        std::cerr << "  mm_bot --monitor <token_id> <poll_ms> <spread>" << std::endl;
+        std::cerr << "  mm_bot --monitor <token_id>       # Monitor order book (HTTP poll)" << std::endl;
+        std::cerr << "  mm_bot --ws-monitor <token_id>    # Monitor order book (WebSocket)" << std::endl;
         return 1;
     }
 
@@ -100,6 +101,52 @@ int main(int argc, char* argv[]) {
         int poll_ms = argc >= 4 ? std::stoi(argv[3]) : 5000;
         double spread = argc >= 5 ? std::stod(argv[4]) : 0.002;
         runMonitor(token_id, poll_ms, spread);
+        return 0;
+    }
+
+    if (arg1 == "--ws-monitor") {
+        if (argc < 3) {
+            std::cerr << "Usage: mm_bot --ws-monitor <token_id>" << std::endl;
+            return 1;
+        }
+        std::string token_id = argv[2];
+
+        mm::WsMarketFeed feed(token_id);
+        int msg_count = 0;
+
+        feed.onBook([&](const mm::OrderBook& ob) {
+            spdlog::info("[BOOK] bid={:.4f} x{:.0f} | ask={:.4f} x{:.0f} | mid={:.4f} | {}/{} levels",
+                         ob.bestBid(), ob.bestBidSize(),
+                         ob.bestAsk(), ob.bestAskSize(),
+                         ob.midPrice(),
+                         ob.bids().size(), ob.asks().size());
+            msg_count++;
+        });
+
+        feed.onPriceChange([&](const mm::BestQuote& q) {
+            int64_t now = mm::nowMs();
+            int64_t latency = now - q.timestamp_ms;
+            spdlog::info("[PRICE] bid={:.4f} ask={:.4f} spread={:.4f} latency={}ms",
+                         q.best_bid, q.best_ask,
+                         q.best_ask - q.best_bid, latency);
+            msg_count++;
+        });
+
+        feed.onTrade([&](mm::Side side, double price, double size) {
+            spdlog::info("[TRADE] {} {:.4f} x{:.2f}",
+                         side == mm::Side::BUY ? "BUY" : "SELL", price, size);
+            msg_count++;
+        });
+
+        feed.start();
+        spdlog::info("WebSocket monitor started, press Ctrl+C to stop");
+
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        feed.stop();
+        spdlog::info("Received {} messages total", msg_count);
         return 0;
     }
 

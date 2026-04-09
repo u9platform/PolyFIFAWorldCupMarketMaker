@@ -20,7 +20,14 @@ FetchContent_Declare(
     GIT_TAG v1.13.0
 )
 
-FetchContent_MakeAvailable(nlohmann_json spdlog)
+FetchContent_Declare(
+    ixwebsocket
+    GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+    GIT_TAG v11.4.5
+)
+set(USE_TLS ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(nlohmann_json spdlog ixwebsocket)
 
 # System dependencies
 find_package(CURL REQUIRED)
@@ -35,10 +42,11 @@ add_library(mm_core STATIC
     src/order_manager.cpp
     src/market_maker.cpp
     src/real_api_client.cpp
+    src/ws_market_feed.cpp
 )
 
 target_include_directories(mm_core PUBLIC src)
-target_link_libraries(mm_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog CURL::libcurl)
+target_link_libraries(mm_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog CURL::libcurl ixwebsocket::ixwebsocket)
 
 # Main executable
 add_executable(mm_bot src/main.cpp)
