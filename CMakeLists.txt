@@ -22,6 +22,9 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nlohmann_json spdlog)
 
+# System dependencies
+find_package(CURL REQUIRED)
+
 # Main library (all modules, linked by tests and main)
 add_library(mm_core STATIC
     src/quote_engine.cpp
@@ -31,10 +34,11 @@ add_library(mm_core STATIC
     src/config.cpp
     src/order_manager.cpp
     src/market_maker.cpp
+    src/real_api_client.cpp
 )
 
 target_include_directories(mm_core PUBLIC src)
-target_link_libraries(mm_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog)
+target_link_libraries(mm_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog CURL::libcurl)
 
 # Main executable
 add_executable(mm_bot src/main.cpp)
