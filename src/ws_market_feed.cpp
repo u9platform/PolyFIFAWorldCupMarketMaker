@@ -29,28 +29,31 @@ BestQuote WsMarketFeed::latestQuote() const {
     return latest_quote_;
 }
 
+void WsMarketFeed::sendSubscribe() {
+    if (!ws_ptr_) return;
+    nlohmann::json sub = {
+        {"assets_ids", {token_id_}},
+        {"type", "market"}
+    };
+    ws_ptr_->send(sub.dump());
+    spdlog::info("WS subscribed to token {}", token_id_.substr(0, 20) + "...");
+}
+
 void WsMarketFeed::run() {
     ix::WebSocket ws;
     ws.setUrl(ws_url_);
     ws.setPingInterval(10);
+    ws.setMinWaitBetweenReconnectionRetries(1000);   // 1s min between retries
+    ws.setMaxWaitBetweenReconnectionRetries(5000);    // 5s max
+    ws_ptr_ = &ws;
 
     ws.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
         switch (msg->type) {
         case ix::WebSocketMessageType::Open:
-        {
             connected_ = true;
             spdlog::info("WS connected to {}", ws_url_);
-
-            // Subscribe
-            nlohmann::json sub = {
-                {"assets_ids", {token_id_}},
-                {"type", "market"}
-            };
-            // Send via the wire (captured in closure)
-            // We need to use msg->wireSize etc, but actually we send via the ws object.
-            // IXWebSocket doesn't give us ws in the callback, so we store it.
+            sendSubscribe();
             break;
-        }
         case ix::WebSocketMessageType::Message:
             processMessage(msg->str);
             break;
@@ -68,28 +71,12 @@ void WsMarketFeed::run() {
 
     ws.start();
 
-    // Wait for connection, then subscribe
-    int retries = 0;
-    while (running_ && !connected_ && retries < 50) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        retries++;
-    }
-
-    if (connected_) {
-        nlohmann::json sub = {
-            {"assets_ids", {token_id_}},
-            {"type", "market"}
-        };
-        ws.send(sub.dump());
-        spdlog::info("WS subscribed to token {}", token_id_.substr(0, 20) + "...");
-    }
-
-    // Keep alive, send PING every 10s
     while (running_) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     ws.stop();
+    ws_ptr_ = nullptr;
     connected_ = false;
     spdlog::info("WS feed stopped");
 }

@@ -9,6 +9,8 @@
 #include <atomic>
 #include <mutex>
 
+namespace ix { class WebSocket; }
+
 namespace mm {
 
 struct BestQuote {
@@ -42,11 +44,13 @@ public:
 
 private:
     void run();
+    void sendSubscribe();
     void processMessage(const std::string& msg);
     void processPriceChange(const nlohmann::json& data);
 
     std::string token_id_;
     std::string ws_url_ = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    ix::WebSocket* ws_ptr_ = nullptr;  // non-owning, valid during run()
 
     BookCallback book_cb_;
     PriceChangeCallback price_cb_;
