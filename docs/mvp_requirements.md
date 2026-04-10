@@ -2,23 +2,24 @@
 
 ## 目标
 
-在 Polymarket 2026 FIFA World Cup Winner 市场上，选择单一队伍（日本），提供双边报价，验证做市可行性。
+在 Polymarket 2026 FIFA World Cup Winner 市场上，同时对多个队伍提供双边报价，验证做市可行性。
 
 ## 范围
 
 ### IN SCOPE
-- 单一市场（Japan YES token）
+- 多市场同时做市（支持 N 个队伍并行）
 - 固定 spread 报价
-- 单层 bid/ask 挂单
+- 单层 bid/ask 挂单（每个市场独立一对）
 - 成交后自动重新报价
-- PnL 记录与统计
+- Per-market PnL 记录与 portfolio 级汇总
+- WebSocket 实时行情 + HTTP 轮询 fallback
+- 自动重连与重新订阅
 
 ### OUT OF SCOPE
 - 外部赔率数据（Pinnacle/Betfair）
 - 全局概率归一化
 - Avellaneda-Stoikov 模型
 - 库存 skew 调整
-- 多市场同时做市
 - 风控熔断机制
 
 ---
@@ -30,6 +31,10 @@
 - F1.1: 通过 Polymarket CLOB API 获取指定市场的 order book（best bid/ask 及深度）
 - F1.2: 计算 mid-price 作为 fair value
 - F1.3: 定时轮询 order book，更新频率可配置（默认 10 秒）
+- F1.4: WebSocket 实时行情（wss://ws-subscriptions-clob.polymarket.com/ws/market）
+  - 单连接订阅多个 token，接收 book/price_change/last_trade_price 事件
+  - 断连后自动重连并重新发送订阅
+- F1.5: Per-token 最新 BestQuote 缓存，线程安全读取
 
 ### F2: 报价引擎
 
@@ -55,9 +60,10 @@
 
 ### F4: 持仓管理
 
-- F4.1: 跟踪当前 YES token 持仓数量
+- F4.1: Per-market 跟踪 YES token 持仓数量
 - F4.2: 跟踪 USDC 余额
-- F4.3: 记录每笔成交明细（时间、方向、价格、数量）
+- F4.3: 记录每笔成交明细（时间、方向、价格、数量、所属市场）
+- F4.4: Portfolio 级敞口计算: Σ(position_i × mid_i)
 
 ### F5: PnL 统计
 
@@ -79,7 +85,8 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `market_token_id` | string | Japan YES token ID | 目标市场 token |
+| `market_token_id` | string | - | 单市场模式 token (向后兼容) |
+| `market_token_ids` | string[] | - | 多市场模式 token 列表 |
 | `spread` | double | 0.002 | 双边总 spread (0.2%) |
 | `order_size` | double | 100 | 每笔挂单数量 (shares) |
 | `poll_interval_ms` | int | 10000 | order book 轮询间隔 (毫秒) |
@@ -96,6 +103,9 @@
 
 ### NF1: 性能
 - 从检测到 mid-price 变化到新订单发出，延迟 < 500ms
+- HTTP 连接复用（persistent curl handle + TCP_NODELAY + keepalive）
+- WebSocket 单连接多市场，推送延迟 < 10ms（爱尔兰部署）
+- 多市场顺序处理，单次 tick 遍历所有市场
 
 ### NF2: 可靠性
 - API 请求失败时自动重试（最多 3 次，间隔 1 秒）
@@ -123,21 +133,23 @@
   ▼
 主循环 ─────────────────────────────────────┐
   │                                         │
-  ├─ 1. 拉取 order book                     │
-  ├─ 2. 检查订单状态（成交/部分成交）         │
-  │     └─ 有成交 → 更新持仓，记录PnL        │
-  ├─ 3. 计算 mid-price                      │
-  ├─ 4. 需要重新报价?（mid变化/有成交/缺腿） │
-  │     ├─ YES → 撤旧单，计算新价，挂新单    │
-  │     └─ NO  → 无操作                     │
-  ├─ 5. 到 PnL 报告时间? → 输出报告          │
-  ├─ 6. sleep(poll_interval)                │
+  ├─ 1. 检查所有活跃订单状态（一次性）        │
+  │     └─ 有成交 → 定位所属市场，更新持仓    │
+  ├─ 2. 遍历每个市场:                        │
+  │     ├─ 拉取 order book                   │
+  │     ├─ 计算 mid-price                    │
+  │     ├─ 需要重新报价?                     │
+  │     │   ├─ YES → 撤旧单，计算新价，挂新单│
+  │     │   └─ NO  → 跳过                   │
+  │     └─ (下一个市场)                      │
+  ├─ 3. 到 PnL 报告时间? → 输出各市场报告    │
+  ├─ 4. sleep(poll_interval)                │
   └─────────────────────────────────────────┘
 
 退出信号 (Ctrl+C)
   │
-  ├─ 撤销所有活跃订单
-  ├─ 输出最终 PnL 报告
+  ├─ 撤销所有市场的活跃订单
+  ├─ 输出 per-market PnL + portfolio 总敞口
   └─ 退出
 ```
 
@@ -160,8 +172,10 @@
 ## 技术选型
 
 - 语言: C++17
-- HTTP 客户端: libcurl 或 cpp-httplib
+- HTTP 客户端: libcurl (persistent handle, connection reuse)
+- WebSocket: ixwebsocket (v11.4.5)
 - JSON 解析: nlohmann/json
 - 签名: OpenSSL (ECDSA for Polymarket order signing)
-- 构建: CMake
+- 构建: CMake + FetchContent
 - 日志: spdlog
+- 部署: AWS EC2 eu-west-1 (Ireland, ~8ms WS latency to Polymarket)

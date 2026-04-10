@@ -227,7 +227,7 @@ TEST: PnlReporter_总PnL等于已实现加未实现
 
 ```
 TEST: Config_加载默认值
-  GIVEN: 空配置文件
+  GIVEN: 配置文件含必要字段 + market_token_id
   WHEN:  load()
   THEN:  spread = 0.002, order_size = 100, poll_interval_ms = 10000
 
@@ -235,6 +235,21 @@ TEST: Config_加载自定义值
   GIVEN: 配置文件 {"spread": 0.004, "order_size": 200}
   WHEN:  load()
   THEN:  spread = 0.004, order_size = 200, poll_interval_ms = 10000 (默认)
+
+TEST: Config_多市场token列表
+  GIVEN: 配置文件 {"market_token_ids": ["token1", "token2", "token3"]}
+  WHEN:  load()
+  THEN:  allTokenIds() 返回 3 个 token
+
+TEST: Config_单市场向后兼容
+  GIVEN: 配置文件 {"market_token_id": "token1"}
+  WHEN:  load()
+  THEN:  allTokenIds() 返回 ["token1"]
+
+TEST: Config_无market字段
+  GIVEN: 配置文件无 market_token_id 也无 market_token_ids
+  WHEN:  load()
+  THEN:  抛出 ConfigError
 
 TEST: Config_无效spread_负数
   GIVEN: 配置文件 {"spread": -0.001}
@@ -384,6 +399,35 @@ TEST: MarketMaker_退出时撤单失败
   THEN:  日志输出未撤掉的订单ID, 供人工处理
 ```
 
+### 2.3 多市场 (MarketMaker Multi-Market)
+
+```
+TEST: MarketMaker_多市场初始化
+  GIVEN: Config 含 3 个 token_id
+  WHEN:  构造 MarketMaker
+  THEN:  marketCount() == 3
+
+TEST: MarketMaker_多市场各自独立报价
+  GIVEN: 3 个市场, Mock API 为每个返回不同 order book
+  WHEN:  tick()
+  THEN:  每个市场各下 1 bid + 1 ask, 共 6 个订单, 各自 mid 不同
+
+TEST: MarketMaker_多市场独立fill
+  GIVEN: 3 个市场都有活跃订单, 市场A的bid成交
+  WHEN:  tick()
+  THEN:  只有市场A更新持仓和重新挂单, 市场B/C不受影响
+
+TEST: MarketMaker_portfolio敞口计算
+  GIVEN: 市场A持仓100@0.02, 市场B持仓-50@0.15
+  WHEN:  portfolioExposure()
+  THEN:  返回 100*0.02 + (-50)*0.15 = 2.0 - 7.5 = -5.5
+
+TEST: MarketMaker_多市场优雅退出
+  GIVEN: 3 个市场各有 2 个活跃订单
+  WHEN:  stop()
+  THEN:  6 个订单全部撤销, 输出 3 条 per-market PnL 报告
+```
+
 ---
 
 ## 3. E2E Tests (手动)
@@ -433,13 +477,13 @@ tests/
 │   ├── test_order_book.cpp        # 8 tests
 │   ├── test_position_tracker.cpp  # 11 tests
 │   ├── test_pnl_reporter.cpp      # 7 tests
-│   └── test_config.cpp            # 7 tests
+│   └── test_config.cpp            # 10 tests (+3 multi-market)
 ├── integration/
 │   ├── test_order_manager.cpp     # 9 tests
-│   └── test_market_maker.cpp      # 13 tests
+│   └── test_market_maker.cpp      # 18 tests (+5 multi-market)
 ├── mocks/
 │   └── mock_api_client.h
 └── CMakeLists.txt
 
-Total: 64 tests
+Total: 72 tests
 ```

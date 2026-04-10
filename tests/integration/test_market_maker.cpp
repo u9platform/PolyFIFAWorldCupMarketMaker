@@ -274,3 +274,129 @@ TEST_F(MarketMakerTest, GracefulShutdown_CancelPartialFailure) {
     // stop should not throw, but log the failure
     EXPECT_NO_THROW(mm.stop());
 }
+
+// === Multi-market tests ===
+
+class MultiMarketTest : public ::testing::Test {
+protected:
+    MockApiClient mock_api;
+    Config config;
+
+    void SetUp() override {
+        config.market_token_ids = {"tokenA", "tokenB", "tokenC"};
+        config.spread = 0.002;
+        config.order_size = 100;
+        config.requote_threshold = 0.001;
+        config.api_key = "key";
+        config.api_secret = "secret";
+        config.private_key = "pk";
+    }
+};
+
+TEST_F(MultiMarketTest, InitializesAllMarkets) {
+    MarketMaker mm(config, mock_api);
+    EXPECT_EQ(mm.marketCount(), 3u);
+}
+
+TEST_F(MultiMarketTest, EachMarketGetsIndependentQuotes) {
+    EXPECT_CALL(mock_api, getBalance()).WillRepeatedly(Return(1000.0));
+    EXPECT_CALL(mock_api, getOrderBook("tokenA")).WillOnce(Return(validBook(0.021, 0.023)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenB")).WillOnce(Return(validBook(0.150, 0.160)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenC")).WillOnce(Return(validBook(0.030, 0.040)));
+    EXPECT_CALL(mock_api, placeOrder(_, _, _, _))
+        .WillOnce(Return("a_bid")).WillOnce(Return("a_ask"))
+        .WillOnce(Return("b_bid")).WillOnce(Return("b_ask"))
+        .WillOnce(Return("c_bid")).WillOnce(Return("c_ask"));
+    EXPECT_CALL(mock_api, getOrderStatus(_)).WillRepeatedly(Return(OrderStatus::LIVE));
+
+    MarketMaker mm(config, mock_api);
+    mm.tick();
+
+    EXPECT_EQ(mm.orderManager().activeOrders().size(), 6u);
+    EXPECT_NEAR(mm.lastMid("tokenA"), 0.022, 1e-9);
+    EXPECT_NEAR(mm.lastMid("tokenB"), 0.155, 1e-9);
+    EXPECT_NEAR(mm.lastMid("tokenC"), 0.035, 1e-9);
+}
+
+TEST_F(MultiMarketTest, FillInOneMarketDoesNotAffectOthers) {
+    EXPECT_CALL(mock_api, getBalance()).WillRepeatedly(Return(1000.0));
+    EXPECT_CALL(mock_api, getOrderBook("tokenA")).WillRepeatedly(Return(validBook(0.021, 0.023)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenB")).WillRepeatedly(Return(validBook(0.150, 0.160)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenC")).WillRepeatedly(Return(validBook(0.030, 0.040)));
+
+    EXPECT_CALL(mock_api, placeOrder(_, _, _, _))
+        .WillOnce(Return("a_bid")).WillOnce(Return("a_ask"))
+        .WillOnce(Return("b_bid")).WillOnce(Return("b_ask"))
+        .WillOnce(Return("c_bid")).WillOnce(Return("c_ask"))
+        // After fill in A: re-place A's bid+ask
+        .WillOnce(Return("a_bid2")).WillOnce(Return("a_ask2"));
+
+    // Tick 1: all LIVE
+    // Tick 2: a_bid filled, rest LIVE
+    EXPECT_CALL(mock_api, getOrderStatus("a_bid")).WillOnce(Return(OrderStatus::FILLED));
+    EXPECT_CALL(mock_api, getFilledQty("a_bid")).WillOnce(Return(100.0));
+    EXPECT_CALL(mock_api, getOrderStatus("a_ask"))
+        .WillOnce(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, cancelOrder("a_ask")).Times(1);
+    EXPECT_CALL(mock_api, getOrderStatus("b_bid")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("b_ask")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("c_bid")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("c_ask")).WillRepeatedly(Return(OrderStatus::LIVE));
+
+    MarketMaker mm(config, mock_api);
+    mm.tick();  // initial placement
+    mm.tick();  // a_bid fills
+
+    EXPECT_DOUBLE_EQ(mm.positionTracker("tokenA").yesPosition(), 100.0);
+    EXPECT_DOUBLE_EQ(mm.positionTracker("tokenB").yesPosition(), 0.0);
+    EXPECT_DOUBLE_EQ(mm.positionTracker("tokenC").yesPosition(), 0.0);
+}
+
+TEST_F(MultiMarketTest, PortfolioExposure) {
+    EXPECT_CALL(mock_api, getBalance()).WillRepeatedly(Return(1000.0));
+    EXPECT_CALL(mock_api, getOrderBook("tokenA")).WillRepeatedly(Return(validBook(0.019, 0.021)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenB")).WillRepeatedly(Return(validBook(0.140, 0.160)));
+    EXPECT_CALL(mock_api, getOrderBook("tokenC")).WillRepeatedly(Return(validBook(0.030, 0.040)));
+
+    EXPECT_CALL(mock_api, placeOrder(_, _, _, _))
+        .WillOnce(Return("a_bid")).WillOnce(Return("a_ask"))
+        .WillOnce(Return("b_bid")).WillOnce(Return("b_ask"))
+        .WillOnce(Return("c_bid")).WillOnce(Return("c_ask"))
+        .WillRepeatedly(Return("x"));  // for re-placements
+
+    // a_bid fills (buy 100 @ tokenA), b_ask fills (sell 50 @ tokenB)
+    EXPECT_CALL(mock_api, getOrderStatus("a_bid")).WillOnce(Return(OrderStatus::FILLED));
+    EXPECT_CALL(mock_api, getFilledQty("a_bid")).WillOnce(Return(100.0));
+    EXPECT_CALL(mock_api, getOrderStatus("b_ask")).WillOnce(Return(OrderStatus::FILLED));
+    EXPECT_CALL(mock_api, getFilledQty("b_ask")).WillOnce(Return(50.0));
+    EXPECT_CALL(mock_api, getOrderStatus("a_ask")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("b_bid")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("c_bid")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, getOrderStatus("c_ask")).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, cancelOrder(_)).WillRepeatedly(Return());
+
+    MarketMaker mm(config, mock_api);
+    mm.tick();
+    mm.tick();
+
+    // tokenA: +100, mid=0.020. tokenB: -50, mid=0.150
+    // exposure = 100*0.020 + (-50)*0.150 = 2.0 - 7.5 = -5.5
+    EXPECT_NEAR(mm.portfolioExposure(), 100 * 0.020 + (-50) * 0.150, 0.01);
+}
+
+TEST_F(MultiMarketTest, GracefulShutdownAllMarkets) {
+    EXPECT_CALL(mock_api, getBalance()).WillRepeatedly(Return(1000.0));
+    EXPECT_CALL(mock_api, getOrderBook(_)).WillRepeatedly(Return(validBook(0.021, 0.023)));
+    EXPECT_CALL(mock_api, placeOrder(_, _, _, _))
+        .WillOnce(Return("a_bid")).WillOnce(Return("a_ask"))
+        .WillOnce(Return("b_bid")).WillOnce(Return("b_ask"))
+        .WillOnce(Return("c_bid")).WillOnce(Return("c_ask"));
+    EXPECT_CALL(mock_api, getOrderStatus(_)).WillRepeatedly(Return(OrderStatus::LIVE));
+    EXPECT_CALL(mock_api, cancelOrder(_)).Times(6);
+
+    MarketMaker mm(config, mock_api);
+    mm.tick();
+
+    mm.stop();
+    EXPECT_TRUE(mm.orderManager().activeOrders().empty());
+}

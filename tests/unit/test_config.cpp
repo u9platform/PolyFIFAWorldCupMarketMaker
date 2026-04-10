@@ -88,3 +88,33 @@ TEST_F(ConfigTest, MissingRequiredField) {
 TEST_F(ConfigTest, FileNotFound) {
     EXPECT_THROW(Config::load("/tmp/nonexistent_config_12345.json"), ConfigError);
 }
+
+TEST_F(ConfigTest, MultiMarketTokenIds) {
+    writeConfig(R"({
+        "api_key": "k", "api_secret": "s", "private_key": "p",
+        "market_token_ids": ["token1", "token2", "token3"]
+    })");
+    auto cfg = Config::load(tmp_path);
+    auto ids = cfg.allTokenIds();
+    EXPECT_EQ(ids.size(), 3u);
+    EXPECT_EQ(ids[0], "token1");
+    EXPECT_EQ(ids[2], "token3");
+}
+
+TEST_F(ConfigTest, SingleMarketBackwardCompat) {
+    writeConfig(R"({
+        "api_key": "k", "api_secret": "s", "private_key": "p",
+        "market_token_id": "single_token"
+    })");
+    auto cfg = Config::load(tmp_path);
+    auto ids = cfg.allTokenIds();
+    EXPECT_EQ(ids.size(), 1u);
+    EXPECT_EQ(ids[0], "single_token");
+}
+
+TEST_F(ConfigTest, NoMarketTokenAtAll) {
+    writeConfig(R"({
+        "api_key": "k", "api_secret": "s", "private_key": "p"
+    })");
+    EXPECT_THROW(Config::load(tmp_path), ConfigError);
+}
