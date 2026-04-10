@@ -4,6 +4,7 @@
 #include "order_book.h"
 #include "quote_engine.h"
 #include "ws_market_feed.h"
+#include "dryrun_api_client.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -147,6 +148,47 @@ int main(int argc, char* argv[]) {
 
         feed.stop();
         spdlog::info("Received {} messages total", msg_count);
+        return 0;
+    }
+
+    if (arg1 == "--dryrun") {
+        if (argc < 3) {
+            std::cerr << "Usage: mm_bot --dryrun <token_id> [spread] [size] [poll_ms]" << std::endl;
+            return 1;
+        }
+        std::string token_id = argv[2];
+        double spread = argc >= 4 ? std::stod(argv[3]) : 0.002;
+        double size = argc >= 5 ? std::stod(argv[4]) : 100;
+        int poll_ms = argc >= 6 ? std::stoi(argv[5]) : 5000;
+
+        spdlog::info("=== DRY RUN MODE ===");
+        spdlog::info("Token: {}...  Spread: {}  Size: {}  Poll: {}ms",
+                     token_id.substr(0, 20), spread, size, poll_ms);
+
+        mm::DryRunApiClient api;
+        mm::Config cfg;
+        cfg.market_token_id = token_id;
+        cfg.spread = spread;
+        cfg.order_size = size;
+        cfg.poll_interval_ms = poll_ms;
+        cfg.requote_threshold = 0.001;
+        cfg.api_key = "dryrun";
+        cfg.api_secret = "dryrun";
+        cfg.private_key = "dryrun";
+
+        mm::MarketMaker maker(cfg, api);
+        g_mm = &maker;
+
+        // Run WS feed in parallel to simulate fills
+        mm::WsMarketFeed feed(token_id);
+        feed.onPriceChange([&api](const mm::BestQuote& q) {
+            api.simulateFills(q.best_bid, q.best_ask);
+        });
+        feed.start();
+
+        maker.start();
+
+        feed.stop();
         return 0;
     }
 
