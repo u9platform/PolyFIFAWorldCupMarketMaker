@@ -8,12 +8,20 @@ namespace mm {
 MarketMaker::MarketMaker(const Config& config, IApiClient& api)
     : config_(config)
     , api_(api)
-    , order_manager_(api)
-    , pnl_reporter_(position_tracker_) {}
+    , order_manager_(api) {
+
+    auto ids = config.allTokenIds();
+    markets_.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        markets_.emplace_back(ids[i]);
+        market_index_[ids[i]] = i;
+    }
+    spdlog::info("MarketMaker initialized with {} markets", markets_.size());
+}
 
 void MarketMaker::start() {
     running_ = true;
-    spdlog::info("MarketMaker starting for token {}", config_.market_token_id);
+    spdlog::info("MarketMaker starting for {} markets", markets_.size());
 
     while (running_) {
         try {
@@ -29,119 +37,165 @@ void MarketMaker::stop() {
     running_ = false;
     spdlog::info("Stopping MarketMaker, canceling all orders...");
     auto failed = order_manager_.cancelAll();
-    if (!failed.empty()) {
-        for (auto& id : failed) {
-            spdlog::error("Failed to cancel order on shutdown: {}", id);
-        }
+    for (auto& id : failed) {
+        spdlog::error("Failed to cancel order on shutdown: {}", id);
     }
 
-    auto report = pnl_reporter_.generateReport(last_mid_);
-    spdlog::info("Final PnL Report: realized={:.6f} unrealized={:.6f} total={:.6f} trades={}",
-                 report.realized_pnl, report.unrealized_pnl, report.total_pnl, report.total_trades);
+    // Print per-market PnL
+    for (auto& ms : markets_) {
+        double mid = ms.last_mid > 0 ? ms.last_mid : 0;
+        auto r = ms.reporter->generateReport(mid);
+        spdlog::info("PnL [{}...]: realized={:.6f} unrealized={:.6f} total={:.6f} trades={}",
+                     ms.token_id.substr(0, 10), r.realized_pnl, r.unrealized_pnl,
+                     r.total_pnl, r.total_trades);
+    }
+    spdlog::info("Portfolio exposure: {:.6f}", portfolioExposure());
 }
 
 void MarketMaker::tick() {
-    // Step 0: Check balance on first tick
-    if (last_mid_ == 0.0) {
+    // Check balance once
+    if (!balance_checked_) {
         double balance = api_.getBalance();
         if (balance <= 0.0) {
             throw std::runtime_error("Insufficient balance: " + std::to_string(balance));
         }
         spdlog::info("Balance: {:.2f} USDC", balance);
+        balance_checked_ = true;
     }
 
-    // Step 1: Fetch order book
-    auto ob_json = api_.getOrderBook(config_.market_token_id);
-    OrderBook ob;
-    ob.parse(ob_json);
-
-    // Step 2: Check for fills (always, every tick)
-    bool had_fills = false;
-    order_manager_.checkOrders([&](const std::string& id, Side side, double price, double qty) {
-        pnl_reporter_.recordFill(side, price, qty, nowMs());
-        had_fills = true;
-
-        if (side == Side::BUY && id == active_bid_id_) {
-            active_bid_id_.clear();
-        } else if (side == Side::SELL && id == active_ask_id_) {
-            active_ask_id_.clear();
+    // Check fills for ALL markets first (one call checks all active orders)
+    order_manager_.checkOrders([this](const std::string& order_id, Side side,
+                                      double price, double qty) {
+        // Find which market this order belongs to
+        for (auto& ms : markets_) {
+            if (order_id == ms.active_bid_id) {
+                ms.reporter->recordFill(Side::BUY, price, qty, nowMs());
+                ms.active_bid_id.clear();
+                spdlog::info("[{}...] BID FILLED {:.0f}@{:.4f}", ms.token_id.substr(0, 10), qty, price);
+                return;
+            }
+            if (order_id == ms.active_ask_id) {
+                ms.reporter->recordFill(Side::SELL, price, qty, nowMs());
+                ms.active_ask_id.clear();
+                spdlog::info("[{}...] ASK FILLED {:.0f}@{:.4f}", ms.token_id.substr(0, 10), qty, price);
+                return;
+            }
         }
     });
 
-    // Step 3: Handle invalid order book
+    // Tick each market
+    for (auto& ms : markets_) {
+        tickSingleMarket(ms);
+    }
+}
+
+void MarketMaker::tickMarket(const std::string& token_id) {
+    auto it = market_index_.find(token_id);
+    if (it == market_index_.end()) return;
+    tickSingleMarket(markets_[it->second]);
+}
+
+void MarketMaker::tickSingleMarket(MarketState& ms) {
+    // Fetch order book
+    nlohmann::json ob_json;
+    try {
+        ob_json = api_.getOrderBook(ms.token_id);
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}...] Failed to fetch book: {}", ms.token_id.substr(0, 10), e.what());
+        return;
+    }
+
+    OrderBook ob;
+    ob.parse(ob_json);
+
     if (!ob.isValid()) {
-        spdlog::warn("Invalid order book, canceling existing orders");
-        if (!active_bid_id_.empty() || !active_ask_id_.empty()) {
-            order_manager_.cancelAll();
-            active_bid_id_.clear();
-            active_ask_id_.clear();
+        if (!ms.active_bid_id.empty() || !ms.active_ask_id.empty()) {
+            if (!ms.active_bid_id.empty()) {
+                try { order_manager_.cancelOrder(ms.active_bid_id); } catch (...) {}
+                ms.active_bid_id.clear();
+            }
+            if (!ms.active_ask_id.empty()) {
+                try { order_manager_.cancelOrder(ms.active_ask_id); } catch (...) {}
+                ms.active_ask_id.clear();
+            }
         }
         return;
     }
 
-    // Step 4: Check if requote needed
     double new_mid = ob.midPrice();
-    bool mid_changed = QuoteEngine::shouldRequote(last_mid_, new_mid, config_.requote_threshold);
-    bool missing_leg = active_bid_id_.empty() || active_ask_id_.empty();
-    bool need_requote = mid_changed || had_fills || missing_leg;
+    bool mid_changed = QuoteEngine::shouldRequote(ms.last_mid, new_mid, config_.requote_threshold);
+    bool missing_leg = ms.active_bid_id.empty() || ms.active_ask_id.empty();
+    bool need_requote = mid_changed || missing_leg;
 
-    if (!need_requote) {
-        return;
+    if (!need_requote) return;
+
+    // Cancel existing
+    if (!ms.active_bid_id.empty()) {
+        try { order_manager_.cancelOrder(ms.active_bid_id); } catch (...) {}
+        ms.active_bid_id.clear();
+    }
+    if (!ms.active_ask_id.empty()) {
+        try { order_manager_.cancelOrder(ms.active_ask_id); } catch (...) {}
+        ms.active_ask_id.clear();
     }
 
-    // Step 5: Cancel existing orders
-    if (!active_bid_id_.empty()) {
-        try {
-            order_manager_.cancelOrder(active_bid_id_);
-        } catch (...) {}
-        active_bid_id_.clear();
-    }
-    if (!active_ask_id_.empty()) {
-        try {
-            order_manager_.cancelOrder(active_ask_id_);
-        } catch (...) {}
-        active_ask_id_.clear();
-    }
-
-    // Step 6: Calculate new quotes and place
-    last_mid_ = new_mid;
+    ms.last_mid = new_mid;
     auto quote = QuoteEngine::calculateQuotes(new_mid, config_.spread);
-    if (!quote.has_value()) {
-        spdlog::warn("Cannot calculate quotes for mid={}", new_mid);
-        return;
-    }
+    if (!quote.has_value()) return;
 
-    placeBothSides(*quote);
+    placeBothSides(ms, *quote);
 }
 
-void MarketMaker::placeBothSides(const Quote& quote) {
+void MarketMaker::placeBothSides(MarketState& ms, const Quote& quote) {
     std::string bid_id, ask_id;
 
     try {
-        bid_id = order_manager_.placeOrder(
-            config_.market_token_id, Side::BUY, quote.bid_price, config_.order_size);
+        bid_id = order_manager_.placeOrder(ms.token_id, Side::BUY, quote.bid_price, config_.order_size);
     } catch (const ApiError& e) {
-        spdlog::error("Failed to place bid: {}", e.what());
+        spdlog::error("[{}...] Failed to place bid: {}", ms.token_id.substr(0, 10), e.what());
         return;
     }
 
     try {
-        ask_id = order_manager_.placeOrder(
-            config_.market_token_id, Side::SELL, quote.ask_price, config_.order_size);
+        ask_id = order_manager_.placeOrder(ms.token_id, Side::SELL, quote.ask_price, config_.order_size);
     } catch (const ApiError& e) {
-        spdlog::error("Failed to place ask: {}, canceling bid {}", e.what(), bid_id);
-        try {
-            order_manager_.cancelOrder(bid_id);
-        } catch (...) {
-            spdlog::error("Failed to cancel orphaned bid {}", bid_id);
-        }
+        spdlog::error("[{}...] Failed to place ask, canceling bid", ms.token_id.substr(0, 10));
+        try { order_manager_.cancelOrder(bid_id); } catch (...) {}
         return;
     }
 
-    active_bid_id_ = bid_id;
-    active_ask_id_ = ask_id;
-    spdlog::info("Quotes placed: bid={:.4f} ask={:.4f} mid={:.4f}",
-                 quote.bid_price, quote.ask_price, last_mid_);
+    ms.active_bid_id = bid_id;
+    ms.active_ask_id = ask_id;
+    spdlog::info("[{}...] Quotes: bid={:.4f} ask={:.4f} mid={:.4f}",
+                 ms.token_id.substr(0, 10), quote.bid_price, quote.ask_price, ms.last_mid);
+}
+
+// Backward compat accessors (first market)
+const PositionTracker& MarketMaker::positionTracker() const {
+    return markets_.at(0).position;
+}
+
+const PositionTracker& MarketMaker::positionTracker(const std::string& token_id) const {
+    auto it = market_index_.find(token_id);
+    return markets_.at(it->second).position;
+}
+
+double MarketMaker::lastMid() const {
+    return markets_.empty() ? 0.0 : markets_[0].last_mid;
+}
+
+double MarketMaker::lastMid(const std::string& token_id) const {
+    auto it = market_index_.find(token_id);
+    if (it == market_index_.end()) return 0.0;
+    return markets_[it->second].last_mid;
+}
+
+double MarketMaker::portfolioExposure() const {
+    double total = 0;
+    for (auto& ms : markets_) {
+        total += ms.position.yesPosition() * ms.last_mid;
+    }
+    return total;
 }
 
 } // namespace mm

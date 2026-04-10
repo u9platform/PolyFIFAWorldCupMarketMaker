@@ -2,6 +2,8 @@
 
 #include "api_client.h"
 #include <string>
+#include <mutex>
+#include <curl/curl.h>
 
 namespace mm {
 
@@ -12,11 +14,14 @@ public:
                            const std::string& private_key = "");
     ~RealApiClient() override;
 
-    // Public endpoints (no auth required)
+    // Not copyable (owns curl handle)
+    RealApiClient(const RealApiClient&) = delete;
+    RealApiClient& operator=(const RealApiClient&) = delete;
+
     nlohmann::json getOrderBook(const std::string& token_id) override;
     double getBalance() override;
 
-    // Authenticated endpoints (not yet implemented)
+    // Authenticated (not yet implemented)
     std::string placeOrder(const std::string& token_id, Side side,
                            double price, double size) override;
     void cancelOrder(const std::string& order_id) override;
@@ -30,6 +35,10 @@ private:
     std::string api_key_;
     std::string api_secret_;
     std::string private_key_;
+
+    CURL* curl_ = nullptr;          // Persistent handle — connection reuse
+    std::mutex curl_mutex_;          // Serialize access from multiple threads
+    struct curl_slist* headers_ = nullptr;
 };
 
 } // namespace mm

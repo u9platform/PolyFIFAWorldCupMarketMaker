@@ -19,7 +19,6 @@ Config Config::load(const std::string& filepath) {
 
     Config cfg;
 
-    // Required fields
     auto require = [&](const char* key) {
         if (!j.contains(key)) {
             throw ConfigError(std::string("Missing required field: ") + key);
@@ -29,14 +28,19 @@ Config Config::load(const std::string& filepath) {
     require("api_key");
     require("api_secret");
     require("private_key");
-    require("market_token_id");
 
     cfg.api_key = j["api_key"].get<std::string>();
     cfg.api_secret = j["api_secret"].get<std::string>();
     cfg.private_key = j["private_key"].get<std::string>();
-    cfg.market_token_id = j["market_token_id"].get<std::string>();
 
-    // Optional fields with defaults
+    // Support both single and multi token config
+    if (j.contains("market_token_ids")) {
+        cfg.market_token_ids = j["market_token_ids"].get<std::vector<std::string>>();
+    }
+    if (j.contains("market_token_id")) {
+        cfg.market_token_id = j["market_token_id"].get<std::string>();
+    }
+
     if (j.contains("spread")) cfg.spread = j["spread"].get<double>();
     if (j.contains("order_size")) cfg.order_size = j["order_size"].get<double>();
     if (j.contains("poll_interval_ms")) cfg.poll_interval_ms = j["poll_interval_ms"].get<int>();
@@ -64,14 +68,8 @@ void Config::validate() const {
     if (api_key.empty()) {
         throw ConfigError("Missing required field: api_key");
     }
-    if (api_secret.empty()) {
-        throw ConfigError("Missing required field: api_secret");
-    }
-    if (private_key.empty()) {
-        throw ConfigError("Missing required field: private_key");
-    }
-    if (market_token_id.empty()) {
-        throw ConfigError("Missing required field: market_token_id");
+    if (allTokenIds().empty()) {
+        throw ConfigError("Missing required field: market_token_id or market_token_ids");
     }
 }
 

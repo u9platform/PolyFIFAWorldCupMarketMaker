@@ -1,11 +1,15 @@
 #include "ws_market_feed.h"
 #include <ixwebsocket/IXWebSocket.h>
 #include <spdlog/spdlog.h>
+#include <unordered_set>
 
 namespace mm {
 
 WsMarketFeed::WsMarketFeed(const std::string& token_id)
-    : token_id_(token_id) {}
+    : token_ids_({token_id}), token_set_({token_id}) {}
+
+WsMarketFeed::WsMarketFeed(const std::vector<std::string>& token_ids)
+    : token_ids_(token_ids), token_set_(token_ids.begin(), token_ids.end()) {}
 
 WsMarketFeed::~WsMarketFeed() {
     stop();
@@ -24,27 +28,29 @@ void WsMarketFeed::stop() {
     }
 }
 
-BestQuote WsMarketFeed::latestQuote() const {
+BestQuote WsMarketFeed::latestQuote(const std::string& token_id) const {
     std::lock_guard<std::mutex> lock(quote_mutex_);
-    return latest_quote_;
+    auto it = latest_quotes_.find(token_id);
+    if (it != latest_quotes_.end()) return it->second;
+    return {};
 }
 
 void WsMarketFeed::sendSubscribe() {
     if (!ws_ptr_) return;
     nlohmann::json sub = {
-        {"assets_ids", {token_id_}},
+        {"assets_ids", token_ids_},
         {"type", "market"}
     };
     ws_ptr_->send(sub.dump());
-    spdlog::info("WS subscribed to token {}", token_id_.substr(0, 20) + "...");
+    spdlog::info("WS subscribed to {} tokens", token_ids_.size());
 }
 
 void WsMarketFeed::run() {
     ix::WebSocket ws;
     ws.setUrl(ws_url_);
     ws.setPingInterval(10);
-    ws.setMinWaitBetweenReconnectionRetries(1000);   // 1s min between retries
-    ws.setMaxWaitBetweenReconnectionRetries(5000);    // 5s max
+    ws.setMinWaitBetweenReconnectionRetries(1000);
+    ws.setMaxWaitBetweenReconnectionRetries(5000);
     ws_ptr_ = &ws;
 
     ws.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
@@ -87,39 +93,64 @@ void WsMarketFeed::processMessage(const std::string& msg) {
     try {
         auto data = nlohmann::json::parse(msg);
 
-        // Handle array of events
-        std::vector<nlohmann::json> events;
+        // Handle both single object and array
         if (data.is_array()) {
-            for (auto& e : data) events.push_back(e);
-        } else {
-            events.push_back(data);
-        }
-
-        for (auto& ev : events) {
-            auto evt = ev.value("event_type", "");
-
+            for (auto& ev : data) {
+                if (!ev.is_object()) continue;
+                auto evt = ev.value("event_type", "");
+                if (evt == "book") {
+                    auto asset_id = ev.value("asset_id", "");
+                    if (token_set_.count(asset_id) == 0) continue;
+                    OrderBook ob;
+                    ob.parse(ev);
+                    if (ob.isValid()) {
+                        BestQuote q{ob.bestBid(), ob.bestAsk(),
+                                    std::stoll(ev.value("timestamp", "0"))};
+                        {
+                            std::lock_guard<std::mutex> lock(quote_mutex_);
+                            latest_quotes_[asset_id] = q;
+                        }
+                        if (book_cb_) book_cb_(asset_id, ob);
+                    }
+                } else if (evt == "price_change") {
+                    processPriceChange(ev);
+                } else if (evt == "last_trade_price") {
+                    auto asset_id = ev.value("asset_id", "");
+                    if (token_set_.count(asset_id) == 0) continue;
+                    if (trade_cb_) {
+                        Side side = ev.value("side", "") == "BUY" ? Side::BUY : Side::SELL;
+                        trade_cb_(asset_id, side,
+                                  std::stod(ev.value("price", "0")),
+                                  std::stod(ev.value("size", "0")));
+                    }
+                }
+            }
+        } else if (data.is_object()) {
+            auto evt = data.value("event_type", "");
             if (evt == "book") {
-                // Full order book snapshot
+                auto asset_id = data.value("asset_id", "");
+                if (token_set_.count(asset_id) == 0) return;
                 OrderBook ob;
-                ob.parse(ev);
+                ob.parse(data);
                 if (ob.isValid()) {
+                    BestQuote q{ob.bestBid(), ob.bestAsk(),
+                                std::stoll(data.value("timestamp", "0"))};
                     {
                         std::lock_guard<std::mutex> lock(quote_mutex_);
-                        latest_quote_.best_bid = ob.bestBid();
-                        latest_quote_.best_ask = ob.bestAsk();
-                        latest_quote_.timestamp_ms = std::stoll(ev.value("timestamp", "0"));
+                        latest_quotes_[asset_id] = q;
                     }
-                    if (book_cb_) book_cb_(ob);
+                    if (book_cb_) book_cb_(asset_id, ob);
                 }
             } else if (evt == "price_change") {
-                processPriceChange(ev);
+                processPriceChange(data);
             } else if (evt == "last_trade_price") {
+                auto asset_id = data.value("asset_id", "");
+                if (token_set_.count(asset_id) == 0) return;
                 if (trade_cb_) {
-                    auto side_str = ev.value("side", "");
-                    Side side = (side_str == "BUY") ? Side::BUY : Side::SELL;
-                    double price = std::stod(ev.value("price", "0"));
-                    double size = std::stod(ev.value("size", "0"));
-                    trade_cb_(side, price, size);
+                    Side side = data.value("side", "") == "BUY" ? Side::BUY : Side::SELL;
+                    trade_cb_(asset_id, side,
+                              std::stod(data.value("price", "0")),
+                              std::stod(data.value("size", "0")));
                 }
             }
         }
@@ -129,28 +160,23 @@ void WsMarketFeed::processMessage(const std::string& msg) {
 }
 
 void WsMarketFeed::processPriceChange(const nlohmann::json& data) {
-    auto changes = data.value("price_changes", nlohmann::json::array());
+    auto ts = std::stoll(data.value("timestamp", "0"));
+    auto& changes = data["price_changes"];
 
     for (auto& c : changes) {
         auto asset_id = c.value("asset_id", "");
-        if (asset_id != token_id_) continue;  // Only care about our token
+        if (token_set_.count(asset_id) == 0) continue;
 
         auto best_bid_str = c.value("best_bid", "");
         auto best_ask_str = c.value("best_ask", "");
+        if (best_bid_str.empty() || best_ask_str.empty()) continue;
 
-        if (!best_bid_str.empty() && !best_ask_str.empty()) {
-            BestQuote q;
-            q.best_bid = std::stod(best_bid_str);
-            q.best_ask = std::stod(best_ask_str);
-            q.timestamp_ms = std::stoll(data.value("timestamp", "0"));
-
-            {
-                std::lock_guard<std::mutex> lock(quote_mutex_);
-                latest_quote_ = q;
-            }
-
-            if (price_cb_) price_cb_(q);
+        BestQuote q{std::stod(best_bid_str), std::stod(best_ask_str), ts};
+        {
+            std::lock_guard<std::mutex> lock(quote_mutex_);
+            latest_quotes_[asset_id] = q;
         }
+        if (price_cb_) price_cb_(asset_id, q);
     }
 }
 

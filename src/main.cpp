@@ -115,26 +115,28 @@ int main(int argc, char* argv[]) {
         mm::WsMarketFeed feed(token_id);
         int msg_count = 0;
 
-        feed.onBook([&](const mm::OrderBook& ob) {
-            spdlog::info("[BOOK] bid={:.4f} x{:.0f} | ask={:.4f} x{:.0f} | mid={:.4f} | {}/{} levels",
+        feed.onBook([&](const std::string& asset_id, const mm::OrderBook& ob) {
+            spdlog::info("[BOOK {}...] bid={:.4f} x{:.0f} | ask={:.4f} x{:.0f} | mid={:.4f}",
+                         asset_id.substr(0, 8),
                          ob.bestBid(), ob.bestBidSize(),
                          ob.bestAsk(), ob.bestAskSize(),
-                         ob.midPrice(),
-                         ob.bids().size(), ob.asks().size());
+                         ob.midPrice());
             msg_count++;
         });
 
-        feed.onPriceChange([&](const mm::BestQuote& q) {
+        feed.onPriceChange([&](const std::string& asset_id, const mm::BestQuote& q) {
             int64_t now = mm::nowMs();
             int64_t latency = now - q.timestamp_ms;
-            spdlog::info("[PRICE] bid={:.4f} ask={:.4f} spread={:.4f} latency={}ms",
+            spdlog::info("[PRICE {}...] bid={:.4f} ask={:.4f} spread={:.4f} latency={}ms",
+                         asset_id.substr(0, 8),
                          q.best_bid, q.best_ask,
                          q.best_ask - q.best_bid, latency);
             msg_count++;
         });
 
-        feed.onTrade([&](mm::Side side, double price, double size) {
-            spdlog::info("[TRADE] {} {:.4f} x{:.2f}",
+        feed.onTrade([&](const std::string& asset_id, mm::Side side, double price, double size) {
+            spdlog::info("[TRADE {}...] {} {:.4f} x{:.2f}",
+                         asset_id.substr(0, 8),
                          side == mm::Side::BUY ? "BUY" : "SELL", price, size);
             msg_count++;
         });
@@ -153,21 +155,33 @@ int main(int argc, char* argv[]) {
 
     if (arg1 == "--dryrun") {
         if (argc < 3) {
-            std::cerr << "Usage: mm_bot --dryrun <token_id> [spread] [size] [poll_ms]" << std::endl;
+            std::cerr << "Usage: mm_bot --dryrun <token_id>[,token_id2,...] [spread] [size] [poll_ms]" << std::endl;
             return 1;
         }
-        std::string token_id = argv[2];
+
+        // Parse comma-separated token IDs
+        std::vector<std::string> token_ids;
+        std::string tokens_arg = argv[2];
+        size_t pos = 0;
+        while ((pos = tokens_arg.find(',')) != std::string::npos) {
+            token_ids.push_back(tokens_arg.substr(0, pos));
+            tokens_arg.erase(0, pos + 1);
+        }
+        token_ids.push_back(tokens_arg);
+
         double spread = argc >= 4 ? std::stod(argv[3]) : 0.002;
         double size = argc >= 5 ? std::stod(argv[4]) : 100;
         int poll_ms = argc >= 6 ? std::stoi(argv[5]) : 5000;
 
-        spdlog::info("=== DRY RUN MODE ===");
-        spdlog::info("Token: {}...  Spread: {}  Size: {}  Poll: {}ms",
-                     token_id.substr(0, 20), spread, size, poll_ms);
+        spdlog::info("=== DRY RUN MODE ({} markets) ===", token_ids.size());
+        for (auto& t : token_ids) {
+            spdlog::info("  Token: {}...", t.substr(0, 20));
+        }
+        spdlog::info("Spread: {}  Size: {}  Poll: {}ms", spread, size, poll_ms);
 
         mm::DryRunApiClient api;
         mm::Config cfg;
-        cfg.market_token_id = token_id;
+        cfg.market_token_ids = token_ids;
         cfg.spread = spread;
         cfg.order_size = size;
         cfg.poll_interval_ms = poll_ms;
@@ -179,10 +193,10 @@ int main(int argc, char* argv[]) {
         mm::MarketMaker maker(cfg, api);
         g_mm = &maker;
 
-        // Run WS feed in parallel to simulate fills
-        mm::WsMarketFeed feed(token_id);
-        feed.onPriceChange([&api](const mm::BestQuote& q) {
-            api.simulateFills(q.best_bid, q.best_ask);
+        // Single WS connection for all markets
+        mm::WsMarketFeed feed(token_ids);
+        feed.onPriceChange([&api](const std::string& asset_id, const mm::BestQuote& q) {
+            api.simulateFills(asset_id, q.best_bid, q.best_ask);
         });
         feed.start();
 
