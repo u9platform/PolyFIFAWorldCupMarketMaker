@@ -1,6 +1,7 @@
 #include "volatility_tracker.h"
 #include <cmath>
 #include <numeric>
+#include <vector>
 
 namespace mm {
 
