@@ -155,7 +155,7 @@ int main(int argc, char* argv[]) {
 
     if (arg1 == "--dryrun") {
         if (argc < 3) {
-            std::cerr << "Usage: mm_bot --dryrun <token_id>[,token_id2,...] [spread] [size] [poll_ms]" << std::endl;
+            std::cerr << "Usage: mm_bot --dryrun <token_id>[,token_id2,...] [size] [poll_ms] [gamma]" << std::endl;
             return 1;
         }
 
@@ -169,23 +169,27 @@ int main(int argc, char* argv[]) {
         }
         token_ids.push_back(tokens_arg);
 
-        double spread = argc >= 4 ? std::stod(argv[3]) : 0.002;
-        double size = argc >= 5 ? std::stod(argv[4]) : 100;
-        int poll_ms = argc >= 6 ? std::stoi(argv[5]) : 5000;
+        double size = argc >= 4 ? std::stod(argv[3]) : 100;
+        int poll_ms = argc >= 5 ? std::stoi(argv[4]) : 5000;
+        double gamma = argc >= 6 ? std::stod(argv[5]) : 0.1;
 
-        spdlog::info("=== DRY RUN MODE ({} markets) ===", token_ids.size());
+        spdlog::info("=== DRY RUN MODE ({} markets, AS model) ===", token_ids.size());
         for (auto& t : token_ids) {
             spdlog::info("  Token: {}...", t.substr(0, 20));
         }
-        spdlog::info("Spread: {}  Size: {}  Poll: {}ms", spread, size, poll_ms);
+        spdlog::info("Size: {}  Poll: {}ms  Gamma: {}", size, poll_ms, gamma);
 
         mm::DryRunApiClient api;
         mm::Config cfg;
         cfg.market_token_ids = token_ids;
-        cfg.spread = spread;
         cfg.order_size = size;
         cfg.poll_interval_ms = poll_ms;
         cfg.requote_threshold = 0.001;
+        cfg.gamma = gamma;
+        cfg.min_spread = 0.001;
+        cfg.max_inventory = 1000;
+        cfg.vol_window_size = 100;
+        cfg.expiry_date = "2026-07-20";
         cfg.api_key = "dryrun";
         cfg.api_secret = "dryrun";
         cfg.private_key = "dryrun";

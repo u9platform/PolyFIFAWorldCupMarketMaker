@@ -15,8 +15,15 @@ struct Config {
     std::string market_token_id;              // single market mode
     std::vector<std::string> market_token_ids; // multi-market mode
 
-    double spread = 0.002;
+    double spread = 0.002;       // used only in legacy fixed-spread mode
     double order_size = 100.0;
+
+    // AS model params
+    double gamma = 0.1;
+    double min_spread = 0.001;
+    int vol_window_size = 100;
+    double max_inventory = 1000;
+    std::string expiry_date = "2026-07-20";
     int poll_interval_ms = 10000;
     double requote_threshold = 0.001;
     std::string api_key;

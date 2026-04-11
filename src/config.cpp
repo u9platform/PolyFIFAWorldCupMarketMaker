@@ -41,6 +41,11 @@ Config Config::load(const std::string& filepath) {
         cfg.market_token_id = j["market_token_id"].get<std::string>();
     }
 
+    if (j.contains("gamma")) cfg.gamma = j["gamma"].get<double>();
+    if (j.contains("min_spread")) cfg.min_spread = j["min_spread"].get<double>();
+    if (j.contains("vol_window_size")) cfg.vol_window_size = j["vol_window_size"].get<int>();
+    if (j.contains("max_inventory")) cfg.max_inventory = j["max_inventory"].get<double>();
+    if (j.contains("expiry_date")) cfg.expiry_date = j["expiry_date"].get<std::string>();
     if (j.contains("spread")) cfg.spread = j["spread"].get<double>();
     if (j.contains("order_size")) cfg.order_size = j["order_size"].get<double>();
     if (j.contains("poll_interval_ms")) cfg.poll_interval_ms = j["poll_interval_ms"].get<int>();
