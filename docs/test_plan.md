@@ -79,6 +79,119 @@ TEST: QuoteEngine_整数tick内部表示
   关键: 验证 toTicks(0.001 * 3) == 3 (浮点不丢精度)
 ```
 
+### 1.6 Fair Value 计算 (FairValueCalculator)
+
+```
+TEST: FairValue_默认模式_等于mid
+  GIVEN: mid = 0.022, 无外部数据
+  WHEN:  calculate(mid)
+  THEN:  返回 0.022
+
+TEST: FairValue_外部加权
+  GIVEN: mid = 0.020, external = 0.024, w_ext = 0.7
+  WHEN:  calculate(mid, external)
+  THEN:  返回 0.3*0.020 + 0.7*0.024 = 0.0228
+
+TEST: FairValue_外部不可用_回退mid
+  GIVEN: mid = 0.022, external 不可用
+  WHEN:  calculate(mid)
+  THEN:  返回 0.022 (不管 weight 配置)
+
+TEST: FairValue_偏差保护_偏向外部
+  GIVEN: mid = 0.015, external = 0.025, max_deviation = 0.03
+  WHEN:  偏差 = 0.01 < max_deviation
+  THEN:  正常加权
+
+TEST: FairValue_偏差保护_偏差超限
+  GIVEN: mid = 0.010, external = 0.050, max_deviation = 0.03
+  WHEN:  偏差 = 0.04 > max_deviation
+  THEN:  fair_value 偏向 external (权重更大)
+```
+
+### 1.7 波动率计算 (VolatilityTracker)
+
+```
+TEST: Vol_空窗口_返回最小值
+  GIVEN: 新建 tracker, window_size = 100
+  WHEN:  sigma()
+  THEN:  返回 min_sigma (0.01)
+
+TEST: Vol_单个价格_返回最小值
+  GIVEN: addPrice(0.022)
+  WHEN:  sigma()
+  THEN:  返回 min_sigma
+
+TEST: Vol_恒定价格_返回最小值
+  GIVEN: addPrice(0.022) x 50 次
+  WHEN:  sigma()
+  THEN:  返回 min_sigma (std of returns = 0)
+
+TEST: Vol_已知波动率
+  GIVEN: 交替 addPrice(0.020) 和 addPrice(0.022), 50 次
+  WHEN:  sigma()
+  THEN:  返回 > 0.01 (non-trivial vol)
+
+TEST: Vol_窗口滚动_旧价格丢弃
+  GIVEN: window_size = 5, addPrice 10 次
+  WHEN:  sigma()
+  THEN:  只基于最近 5 个价格计算
+```
+
+### 1.8 AS 模型 (QuoteEngine::calculateAS)
+
+```
+TEST: AS_零库存_reservation等于fair
+  GIVEN: fair = 0.022, q = 0, gamma = 0.1, sigma = 0.5, T-t = 0.28
+  WHEN:  calculateAS()
+  THEN:  reservation_price = 0.022 (无偏移)
+
+TEST: AS_正库存_reservation下移
+  GIVEN: fair = 0.022, q = 100, gamma = 0.1, sigma = 0.5, T-t = 0.28
+  WHEN:  calculateAS()
+  THEN:  reservation_price < 0.022
+
+TEST: AS_负库存_reservation上移
+  GIVEN: fair = 0.022, q = -100, gamma = 0.1, sigma = 0.5, T-t = 0.28
+  WHEN:  calculateAS()
+  THEN:  reservation_price > 0.022
+
+TEST: AS_spread计算
+  GIVEN: gamma = 0.1, sigma = 0.5, T-t = 0.28, k = 5.0
+  WHEN:  calculateAS()
+  THEN:  spread = gamma*sigma^2*(T-t) + (2/gamma)*ln(1+gamma/k)
+         验证 spread > 0
+
+TEST: AS_最小spread强制
+  GIVEN: 计算出的 spread < min_spread
+  WHEN:  calculateAS(min_spread = 0.005)
+  THEN:  实际 spread >= 0.005
+
+TEST: AS_tick对齐
+  GIVEN: AS 计算出 bid = 0.02134, ask = 0.02278
+  WHEN:  calculateAS()
+  THEN:  bid = 0.021 (floor), ask = 0.023 (ceil)
+
+TEST: AS_时间衰减_接近到期spread更窄
+  GIVEN: 相同参数, T-t = 0.28 vs T-t = 0.01
+  WHEN:  calculateAS() 两次
+  THEN:  T-t=0.01 的 spread < T-t=0.28 的 spread
+
+TEST: AS_库存硬上限_只挂ask
+  GIVEN: q = 1500, max_inventory = 1000
+  WHEN:  calculateAS()
+  THEN:  返回的 quote 只有 ask (bid 为空/0)
+
+TEST: AS_库存硬上限_只挂bid
+  GIVEN: q = -1500, max_inventory = 1000
+  WHEN:  calculateAS()
+  THEN:  返回的 quote 只有 bid (ask 为空/0)
+
+TEST: AS_库存在限内_双边都有
+  GIVEN: q = 500, max_inventory = 1000
+  WHEN:  calculateAS()
+  THEN:  bid 和 ask 都有值
+```
+
 ### 1.2 Order Book 解析 (OrderBook)
 
 ```
@@ -473,17 +586,20 @@ E2E-6: 网络断开恢复
 ```
 tests/
 ├── unit/
-│   ├── test_quote_engine.cpp      # 9 tests
+│   ├── test_quote_engine.cpp      # 9 tests (original fixed-spread)
+│   ├── test_as_model.cpp          # 10 tests (AS model)
+│   ├── test_fair_value.cpp        # 5 tests
+│   ├── test_volatility.cpp        # 5 tests
 │   ├── test_order_book.cpp        # 8 tests
 │   ├── test_position_tracker.cpp  # 11 tests
 │   ├── test_pnl_reporter.cpp      # 7 tests
-│   └── test_config.cpp            # 10 tests (+3 multi-market)
+│   └── test_config.cpp            # 10 tests
 ├── integration/
 │   ├── test_order_manager.cpp     # 9 tests
-│   └── test_market_maker.cpp      # 18 tests (+5 multi-market)
+│   └── test_market_maker.cpp      # 18 tests
 ├── mocks/
 │   └── mock_api_client.h
 └── CMakeLists.txt
 
-Total: 72 tests
+Total: 92 tests
 ```

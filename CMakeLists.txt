@@ -43,6 +43,8 @@ add_library(mm_core STATIC
     src/market_maker.cpp
     src/real_api_client.cpp
     src/ws_market_feed.cpp
+    src/fair_value.cpp
+    src/volatility_tracker.cpp
 )
 
 target_include_directories(mm_core PUBLIC src)

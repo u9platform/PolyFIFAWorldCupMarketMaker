@@ -21,6 +21,9 @@ add_mm_test(test_order_book        unit/test_order_book.cpp)
 add_mm_test(test_position_tracker  unit/test_position_tracker.cpp)
 add_mm_test(test_pnl_reporter      unit/test_pnl_reporter.cpp)
 add_mm_test(test_config            unit/test_config.cpp)
+add_mm_test(test_fair_value        unit/test_fair_value.cpp)
+add_mm_test(test_volatility        unit/test_volatility.cpp)
+add_mm_test(test_as_model          unit/test_as_model.cpp)
 
 # Integration tests
 add_mm_test(test_order_manager     integration/test_order_manager.cpp)

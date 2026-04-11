@@ -10,18 +10,36 @@ struct Quote {
     double ask_price;
 };
 
+struct ASParams {
+    double gamma = 0.1;          // risk aversion
+    double min_spread = 0.001;   // minimum spread (1 tick)
+    double k = 5.0;              // order arrival intensity
+    double time_to_expiry = 0.28; // years until expiry
+    double max_inventory = 1000;  // hard inventory cap (shares)
+};
+
+struct ASQuote {
+    double bid_price = 0;        // 0 means "don't place this side"
+    double ask_price = 0;
+    double reservation_price;
+    double optimal_spread;
+};
+
 class QuoteEngine {
 public:
-    // Calculate bid and ask prices from mid and spread.
-    // Returns nullopt if mid_price <= 0.
-    // Prices are aligned to tick, clamped to [0.001, 0.999].
-    // Guarantees ask - bid >= 1 tick.
+    // Original fixed-spread calculation (backward compat).
     static std::optional<Quote> calculateQuotes(double mid_price, double spread);
 
-    // Returns true if |old_mid - new_mid| > threshold.
+    // Avellaneda-Stoikov model.
+    // fair_value: from FairValueCalculator (default = mid)
+    // inventory: current position in shares (positive = long)
+    // sigma: annualized volatility
+    // Returns ASQuote with bid/ask (0 = don't quote that side due to inventory cap).
+    static std::optional<ASQuote> calculateAS(double fair_value, double inventory,
+                                               double sigma, const ASParams& params);
+
     static bool shouldRequote(double old_mid, double new_mid, double threshold);
 
-    // Tick conversion helpers exposed for testing.
     static int64_t toTicks(double price);
     static double fromTicks(int64_t ticks);
 };
