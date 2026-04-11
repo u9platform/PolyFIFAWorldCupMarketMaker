@@ -8,7 +8,7 @@
 
 ### IN SCOPE
 - 多市场同时做市（支持 N 个队伍并行）
-- 固定 spread 报价
+- Avellaneda-Stoikov 报价模型（库存感知的动态 spread）
 - 单层 bid/ask 挂单（每个市场独立一对）
 - 成交后自动重新报价
 - Per-market PnL 记录与 portfolio 级汇总
@@ -18,8 +18,6 @@
 ### OUT OF SCOPE
 - 外部赔率数据（Pinnacle/Betfair）
 - 全局概率归一化
-- Avellaneda-Stoikov 模型
-- 库存 skew 调整
 - 风控熔断机制
 
 ---
@@ -36,19 +34,68 @@
   - 断连后自动重连并重新发送订阅
 - F1.5: Per-token 最新 BestQuote 缓存，线程安全读取
 
-### F2: 报价引擎
+### F2: 报价引擎 (Avellaneda-Stoikov)
 
-- F2.1: 基于 mid-price 和配置的 spread，计算 bid_price 和 ask_price
-  - `bid_price = mid - spread / 2`
-  - `ask_price = mid + spread / 2`
+- F2.1: 基于 AS 模型计算 reservation price 和 optimal spread
+  - **Reservation price** (库存调整后的公允价):
+    ```
+    r = s - q * γ * σ² * (T - t)
+    ```
+    - `s` = 当前 mid-price (from order book)
+    - `q` = 当前库存 (正=多头, 负=空头, 单位: shares)
+    - `γ` = 风险厌恶系数 (可配置, 默认 0.1)
+    - `σ` = 波动率 (从近期价格历史计算)
+    - `T - t` = 距离到期时间 (单位: 年的小数, 世界杯决赛 2026-07-20)
+  - **Optimal spread**:
+    ```
+    δ = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/k)
+    ```
+    - `k` = 订单到达强度 (从近期成交频率估算)
+    - `δ` 为最优总 spread, 但不得小于 `min_spread` (可配置)
+  - **最终报价**:
+    ```
+    bid = r - δ/2
+    ask = r + δ/2
+    ```
 - F2.2: 价格精度对齐到 tick size（0.001）
-  - Rounding 策略: 先将 mid truncate 到 tick 精度，再加减 spread/2（取整到 tick）
-  - 即: `bid = floor((mid - spread/2) / tick) * tick`, `ask = ceil((mid + spread/2) / tick) * tick`
-  - 但如果 ask - bid < tick，则强制 ask = bid + tick
+  - Rounding 策略: `bid = floor(raw_bid / tick) * tick`, `ask = ceil(raw_ask / tick) * tick`
+  - 如果 ask - bid < tick，则强制 ask = bid + tick
   - bid 下限 clamp 到 tick（0.001），ask 上限 clamp 到 0.999
-- F2.5: 内部价格计算统一使用整数 tick 表示（price_ticks = round(price / 0.001)），避免浮点精度问题
-- F2.3: 报价数量（size）可配置，默认 100 shares
-- F2.4: 当 mid-price 变化超过阈值（可配置，默认 1 tick）时，撤旧单挂新单
+- F2.3: 内部价格计算统一使用整数 tick 表示，避免浮点精度问题
+- F2.4: 报价数量（size）可配置，默认 100 shares
+- F2.5: 当 reservation price 变化超过阈值时，撤旧单挂新单
+  - 触发条件: |new_r - old_r| > requote_threshold，或 有成交，或 缺腿
+
+### F7: Avellaneda-Stoikov 参数管理
+
+- F7.1: 波动率计算 (σ)
+  - 使用滑动窗口内的 mid-price 历史，计算已实现波动率
+  - 窗口大小可配置（默认 100 个采样点）
+  - 每次 tick 更新波动率估计
+  - 公式: `σ = std(log(mid[i]/mid[i-1])) * sqrt(samples_per_year)`
+  - 最小值 clamp: σ >= 0.01 (防止 spread 收窄到 0)
+
+- F7.2: 订单到达强度 (k)
+  - 使用滑动窗口内的成交次数估算
+  - `k = num_fills_in_window / window_duration_hours`
+  - 窗口大小可配置（默认 1 小时）
+  - 最小值 clamp: k >= 0.1 (防止 ln(1 + γ/k) 爆炸)
+
+- F7.3: 库存感知
+  - Per-market 库存 `q` 直接从 PositionTracker 读取
+  - 库存为正 → reservation price 下移 → 鼓励卖出
+  - 库存为负 → reservation price 上移 → 鼓励买入
+  - 效果: 自动平衡买卖，防止单边堆积
+
+- F7.4: 库存硬上限 (安全阀)
+  - 当 |q| > max_inventory 时，停止在库存方向继续挂单
+  - 例如: q > max_inventory → 只挂 ask，不挂 bid
+  - max_inventory 可配置（默认 1000 shares per market）
+
+- F7.5: 到期时间衰减
+  - T = 2026-07-20 (世界杯决赛日)
+  - T - t 随时间自然减小
+  - 效果: 越接近到期，spread 越窄，reservation price 对库存越敏感
 
 ### F3: 订单管理
 
@@ -87,15 +134,21 @@
 |------|------|--------|------|
 | `market_token_id` | string | - | 单市场模式 token (向后兼容) |
 | `market_token_ids` | string[] | - | 多市场模式 token 列表 |
-| `spread` | double | 0.002 | 双边总 spread (0.2%) |
 | `order_size` | double | 100 | 每笔挂单数量 (shares) |
 | `poll_interval_ms` | int | 10000 | order book 轮询间隔 (毫秒) |
-| `requote_threshold` | double | 0.001 | mid-price 变化多少触发重新报价 |
+| `requote_threshold` | double | 0.001 | reservation price 变化多少触发重新报价 |
 | `api_key` | string | - | Polymarket API key |
 | `api_secret` | string | - | Polymarket API secret |
 | `private_key` | string | - | 钱包私钥（用于签名订单） |
 | `log_file` | string | `mm.log` | 日志文件路径 |
 | `pnl_report_interval_s` | int | 60 | PnL 报告输出间隔 (秒) |
+| **AS 模型参数** | | | |
+| `gamma` | double | 0.1 | 风险厌恶系数 (越大 → spread 越宽, 库存惩罚越重) |
+| `min_spread` | double | 0.001 | 最小允许 spread (不低于 1 tick) |
+| `vol_window_size` | int | 100 | 波动率计算窗口 (采样点数) |
+| `k_window_hours` | double | 1.0 | 订单到达强度估算窗口 (小时) |
+| `max_inventory` | double | 1000 | 单市场最大持仓 (shares, 超过则停止该方向挂单) |
+| `expiry_date` | string | "2026-07-20" | 到期日 (世界杯决赛日, 用于计算 T-t) |
 
 ---
 
@@ -131,20 +184,30 @@
   ├─ 验证余额和权限
   │
   ▼
-主循环 ─────────────────────────────────────┐
-  │                                         │
-  ├─ 1. 检查所有活跃订单状态（一次性）        │
-  │     └─ 有成交 → 定位所属市场，更新持仓    │
-  ├─ 2. 遍历每个市场:                        │
-  │     ├─ 拉取 order book                   │
-  │     ├─ 计算 mid-price                    │
-  │     ├─ 需要重新报价?                     │
-  │     │   ├─ YES → 撤旧单，计算新价，挂新单│
-  │     │   └─ NO  → 跳过                   │
-  │     └─ (下一个市场)                      │
-  ├─ 3. 到 PnL 报告时间? → 输出各市场报告    │
-  ├─ 4. sleep(poll_interval)                │
-  └─────────────────────────────────────────┘
+主循环 ─────────────────────────────────────────┐
+  │                                             │
+  ├─ 1. 检查所有活跃订单状态（一次性）            │
+  │     └─ 有成交 → 定位所属市场，更新持仓        │
+  ├─ 2. 遍历每个市场:                            │
+  │     ├─ 拉取 order book, 得到 mid (s)         │
+  │     ├─ 更新波动率 σ (滑动窗口)               │
+  │     ├─ 更新订单到达强度 k                    │
+  │     ├─ 读取库存 q                            │
+  │     ├─ AS 计算:                              │
+  │     │   r = s - q * γ * σ² * (T-t)          │
+  │     │   δ = γ * σ² * (T-t) + (2/γ)*ln(1+γ/k)│
+  │     │   δ = max(δ, min_spread)               │
+  │     │   bid = r - δ/2,  ask = r + δ/2       │
+  │     ├─ 库存超限检查:                         │
+  │     │   q > max → 只挂 ask                   │
+  │     │   q < -max → 只挂 bid                  │
+  │     ├─ 需要重新报价?                         │
+  │     │   ├─ YES → 撤旧单，挂新单              │
+  │     │   └─ NO  → 跳过                       │
+  │     └─ (下一个市场)                          │
+  ├─ 3. 到 PnL 报告时间? → 输出各市场报告        │
+  ├─ 4. sleep(poll_interval)                    │
+  └─────────────────────────────────────────────┘
 
 退出信号 (Ctrl+C)
   │
@@ -164,8 +227,18 @@
 | API 链路 | 下单/撤单/查询全部正常 |
 | 双边成交 | bid 和 ask 都有成交记录 |
 | 净 PnL | >= 0（不亏即可） |
-| 单边库存 | 未被单方向打穿（库存 < 配置上限） |
+| 库存平衡 | 买卖次数比在 0.6-1.4 之间（AS 库存调整生效） |
+| 库存硬上限 | 从未触发 max_inventory 熔断 |
+| Spread 动态 | σ 变化时 spread 跟随调整 |
 | 稳定性 | 无需人工干预持续运行 |
+
+与无 AS 模型的对照 (基于 28 小时 dry-run 数据):
+
+| 指标 | 无 AS (实测) | 有 AS (预期) |
+|------|-------------|-------------|
+| 买/卖比 | 67/35 = 1.91 | 接近 1.0 |
+| 净库存 | +3200 shares (单边偏多) | 在 ±max_inventory 内 |
+| PnL | -$144.50 (库存亏损) | > $0 (spread 利润 > 库存成本) |
 
 ---
 
