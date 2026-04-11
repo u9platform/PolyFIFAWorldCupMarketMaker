@@ -16,9 +16,9 @@
 - 自动重连与重新订阅
 
 ### OUT OF SCOPE
-- 外部赔率数据（Pinnacle/Betfair）
-- 全局概率归一化
-- 风控熔断机制
+- 外部赔率数据采集（Pinnacle/Betfair API 接入）— fair value 接口已预留，数据源待接入
+- 全局概率归一化（强制 Σfv=1）— 仅做监控日志，不强制调整
+- 风控熔断机制（价格跳动暂停、流动性枯竭检测）
 
 ---
 
@@ -27,12 +27,54 @@
 ### F1: 市场数据获取
 
 - F1.1: 通过 Polymarket CLOB API 获取指定市场的 order book（best bid/ask 及深度）
-- F1.2: 计算 mid-price 作为 fair value
+- F1.2: 计算 mid-price（作为 fair value 的默认输入）
 - F1.3: 定时轮询 order book，更新频率可配置（默认 10 秒）
 - F1.4: WebSocket 实时行情（wss://ws-subscriptions-clob.polymarket.com/ws/market）
   - 单连接订阅多个 token，接收 book/price_change/last_trade_price 事件
   - 断连后自动重连并重新发送订阅
 - F1.5: Per-token 最新 BestQuote 缓存，线程安全读取
+
+### F8: Fair Value 计算
+
+Fair value 是 AS 模型的核心输入，独立于报价引擎。
+
+```
+数据源层                  Fair Value 层                AS 模型层
+┌──────────────┐
+│ Polymarket   │──→ mid_price ──┐
+│ Order Book   │                │     ┌───────────┐     ┌──────────┐
+└──────────────┘                ├──→  │ fair_value │──→  │ AS 模型  │──→ bid/ask
+┌──────────────┐                │     │ = f(mid,  │     │ r = s-qγσ²τ│
+│ 外部赔率     │──→ ext_price ──┘     │   ext,    │     │ δ = ...   │
+│ (Pinnacle等) │                      │   weights) │     └──────────┘
+└──────────────┘                      └───────────┘
+```
+
+- F8.1: Fair value 接口
+  - 输入: mid_price (必须), external_price (可选)
+  - 输出: fair_value (double)
+  - AS 模型中的 `s` 使用 fair_value 而非 raw mid_price
+
+- F8.2: 默认模式 (无外部数据)
+  - `fair_value = mid_price`
+  - 与现有行为完全一致，无额外开销
+
+- F8.3: 外部赔率锚定模式
+  - `fair_value = w1 * mid_price + w2 * external_price`
+  - 权重按数据源流动性分配（外部流动性通常 >> Polymarket）
+  - 默认权重: w1 = 0.3 (Polymarket), w2 = 0.7 (外部)
+  - 当外部数据不可用时，自动回退到纯 mid_price
+
+- F8.4: 偏差保护
+  - 当 |mid_price - external_price| > max_deviation 时:
+    - 如果偏差持续 > N 秒，fair_value 偏向外部（Polymarket 可能错了）
+    - 如果偏差是瞬时的，保持当前 fair_value（可能是延迟）
+  - max_deviation 可配置（默认 0.03 = 3%）
+
+- F8.5: 全局归一化 (预留)
+  - 当做市 N 个队伍时，所有 fair_values 之和应 ≈ 1.0
+  - 如果加总偏离 1.0 超过阈值，按比例缩放
+  - 当前版本: 不强制归一化（OUT OF SCOPE），仅做监控日志
 
 ### F2: 报价引擎 (Avellaneda-Stoikov)
 
@@ -41,7 +83,7 @@
     ```
     r = s - q * γ * σ² * (T - t)
     ```
-    - `s` = 当前 mid-price (from order book)
+    - `s` = fair_value (from F8, 默认 = mid_price)
     - `q` = 当前库存 (正=多头, 负=空头, 单位: shares)
     - `γ` = 风险厌恶系数 (可配置, 默认 0.1)
     - `σ` = 波动率 (从近期价格历史计算)
@@ -142,6 +184,10 @@
 | `private_key` | string | - | 钱包私钥（用于签名订单） |
 | `log_file` | string | `mm.log` | 日志文件路径 |
 | `pnl_report_interval_s` | int | 60 | PnL 报告输出间隔 (秒) |
+| **Fair Value 参数** | | | |
+| `fv_mode` | string | "mid" | fair value 模式: "mid" / "external_weighted" |
+| `fv_ext_weight` | double | 0.7 | 外部赔率权重 (fv_mode="external_weighted" 时) |
+| `fv_max_deviation` | double | 0.03 | mid 与外部偏差超过此值触发保护 |
 | **AS 模型参数** | | | |
 | `gamma` | double | 0.1 | 风险厌恶系数 (越大 → spread 越宽, 库存惩罚越重) |
 | `min_spread` | double | 0.001 | 最小允许 spread (不低于 1 tick) |
@@ -189,7 +235,9 @@
   ├─ 1. 检查所有活跃订单状态（一次性）            │
   │     └─ 有成交 → 定位所属市场，更新持仓        │
   ├─ 2. 遍历每个市场:                            │
-  │     ├─ 拉取 order book, 得到 mid (s)         │
+  │     ├─ 拉取 order book, 得到 mid             │
+  │     ├─ 计算 fair_value (s):                  │
+  │     │   默认 s=mid, 有外部数据时加权平均      │
   │     ├─ 更新波动率 σ (滑动窗口)               │
   │     ├─ 更新订单到达强度 k                    │
   │     ├─ 读取库存 q                            │
