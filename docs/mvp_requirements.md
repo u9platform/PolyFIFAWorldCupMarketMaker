@@ -7,12 +7,12 @@
 ## 范围
 
 ### IN SCOPE
+- **行情服务**（独立进程，共享内存 IPC）
 - 多市场同时做市（支持 N 个队伍并行）
 - Avellaneda-Stoikov 报价模型（库存感知的动态 spread）
 - 单层 bid/ask 挂单（每个市场独立一对）
 - 成交后自动重新报价
 - Per-market PnL 记录与 portfolio 级汇总
-- WebSocket 实时行情 + HTTP 轮询 fallback
 - 自动重连与重新订阅
 
 ### OUT OF SCOPE
@@ -24,15 +24,129 @@
 
 ## 功能需求
 
-### F1: 市场数据获取
+### F1: 行情服务 (Market Data Service)
 
-- F1.1: 通过 Polymarket CLOB API 获取指定市场的 order book（best bid/ask 及深度）
-- F1.2: 计算 mid-price（作为 fair value 的默认输入）
-- F1.3: 定时轮询 order book，更新频率可配置（默认 10 秒）
-- F1.4: WebSocket 实时行情（wss://ws-subscriptions-clob.polymarket.com/ws/market）
-  - 单连接订阅多个 token，接收 book/price_change/last_trade_price 事件
-  - 断连后自动重连并重新发送订阅
-- F1.5: Per-token 最新 BestQuote 缓存，线程安全读取
+独立进程，通过共享内存向策略进程提供实时行情。
+
+#### F1.1: 架构
+
+```
+┌─────────────────────────────────────────────────┐
+│           Market Data Service (进程 A)           │
+│                                                  │
+│  WS Client ───→ 解析 ───→ 写入共享内存            │
+│  HTTP Poll ──→ 解析 ───→ 写入共享内存 (fallback)  │
+│                                                  │
+│  共享内存布局: MarketDataShm                      │
+│  ┌──────────────────────────────────────┐        │
+│  │ header: magic, version, num_tokens   │        │
+│  │ slot[0]: { seqlock, token_hash,      │        │
+│  │            best_bid, best_ask,       │        │
+│  │            mid, timestamp,           │        │
+│  │            last_trade_price/side/sz, │        │
+│  │            bid_depth[5], ask_depth[5]}│        │
+│  │ slot[1]: { ... }                     │        │
+│  │ ...                                  │        │
+│  │ slot[N-1]: { ... }                   │        │
+│  └──────────────────────────────────────┘        │
+└─────────────────────────────────────────────────┘
+         │  POSIX shared memory (/dev/shm/poly_md)
+         ▼
+┌─────────────────────────────────────────────────┐
+│           Strategy Process (进程 B)              │
+│                                                  │
+│  MarketDataReader ──→ 读 slot ──→ FairValue      │
+│  (seqlock read, 无锁, 纳秒级)     ──→ AS Model  │
+└─────────────────────────────────────────────────┘
+```
+
+#### F1.2: 共享内存数据结构
+
+```cpp
+struct alignas(64) MarketSlot {        // cache-line aligned
+    std::atomic<uint64_t> sequence;    // seqlock: odd=writing, even=ready
+    uint64_t token_hash;               // hash of token_id for fast lookup
+    double best_bid;
+    double best_ask;
+    double mid;
+    int64_t timestamp_ms;              // server timestamp from WS
+    double last_trade_price;
+    int8_t last_trade_side;            // 0=none, 1=BUY, 2=SELL
+    double last_trade_size;
+    // Top 5 depth levels
+    double bid_prices[5];
+    double bid_sizes[5];
+    double ask_prices[5];
+    double ask_sizes[5];
+    char padding[...];                 // pad to 512 bytes
+};
+
+struct MarketDataShm {
+    uint32_t magic = 0x504F4C59;       // "POLY"
+    uint32_t version = 1;
+    uint32_t num_slots;
+    uint32_t reserved;
+    MarketSlot slots[MAX_MARKETS];     // MAX_MARKETS = 64
+};
+```
+
+#### F1.3: Seqlock 读写协议
+
+**Writer (行情服务)**:
+```
+slot.sequence.store(seq + 1, release);   // 标记开始写 (奇数)
+// 写入 best_bid, best_ask, mid, timestamp, ...
+slot.sequence.store(seq + 2, release);   // 标记写完 (偶数)
+```
+
+**Reader (策略进程)**:
+```
+do {
+    seq1 = slot.sequence.load(acquire);
+    if (seq1 & 1) continue;              // 正在写，自旋等待
+    // 读取 best_bid, best_ask, mid, ...
+    seq2 = slot.sequence.load(acquire);
+} while (seq1 != seq2);                  // 读取期间被写入，重试
+```
+
+- 无锁、无系统调用、无内核切换
+- 读延迟: < 100ns
+- 写延迟: < 50ns
+- 适合单 writer 多 reader (SWMR)
+
+#### F1.4: 行情服务职责
+
+- 连接 Polymarket WebSocket，订阅所有配置的 token
+- 解析 book / price_change / last_trade_price 事件
+- 写入对应 slot 的共享内存
+- HTTP fallback: 当 WS 断连超过 N 秒时，切换到 HTTP 轮询
+- 心跳: 每秒更新 header 中的 heartbeat timestamp
+- 策略进程通过 heartbeat 检测行情服务是否存活
+
+#### F1.5: 行情服务 CLI
+
+```bash
+# 启动行情服务
+poly_md --tokens <token1>,<token2>,... --shm-name /poly_md --shm-slots 64
+
+# 行情监控 (读共享内存，打印到终端)
+poly_md --monitor --shm-name /poly_md
+```
+
+#### F1.6: 策略进程读取接口
+
+```cpp
+class MarketDataReader {
+public:
+    MarketDataReader(const std::string& shm_name);
+
+    // 读取指定 token 的最新行情 (seqlock, < 100ns)
+    bool read(uint64_t token_hash, MarketSlot& out) const;
+
+    // 检查行情服务是否存活
+    bool isAlive() const;
+};
+```
 
 ### F8: Fair Value 计算
 
@@ -174,6 +288,10 @@ Fair value 是 AS 模型的核心输入，独立于报价引擎。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
+| **行情服务参数** | | | |
+| `shm_name` | string | "/poly_md" | 共享内存名称 |
+| `shm_slots` | int | 64 | 共享内存最大 token slot 数 |
+| **策略参数** | | | |
 | `market_token_id` | string | - | 单市场模式 token (向后兼容) |
 | `market_token_ids` | string[] | - | 多市场模式 token 列表 |
 | `order_size` | double | 100 | 每笔挂单数量 (shares) |
@@ -201,14 +319,15 @@ Fair value 是 AS 模型的核心输入，独立于报价引擎。
 ## 非功能需求
 
 ### NF1: 性能
-- 从检测到 mid-price 变化到新订单发出，延迟 < 500ms
+- 行情服务 → 策略进程: 共享内存 seqlock, 读延迟 < 100ns
+- 行情服务 WS 推送延迟: < 10ms（爱尔兰部署）
+- 从行情变化到新订单发出: < 500ms
 - HTTP 连接复用（persistent curl handle + TCP_NODELAY + keepalive）
-- WebSocket 单连接多市场，推送延迟 < 10ms（爱尔兰部署）
-- 多市场顺序处理，单次 tick 遍历所有市场
 
 ### NF2: 可靠性
-- API 请求失败时自动重试（最多 3 次，间隔 1 秒）
-- 网络断连后自动重连并恢复报价
+- 行情服务: WS 断连自动重连 + HTTP fallback
+- 策略进程: API 请求失败自动重试（最多 3 次）
+- 行情服务崩溃: 策略进程通过 heartbeat 检测，暂停报价
 
 ### NF3: 安全
 - 私钥从环境变量或配置文件读取，不硬编码
@@ -223,45 +342,41 @@ Fair value 是 AS 模型的核心输入，独立于报价引擎。
 ## 运行流程
 
 ```
-启动
-  │
-  ├─ 读取配置
-  ├─ 初始化 API 连接
-  ├─ 验证余额和权限
-  │
-  ▼
-主循环 ─────────────────────────────────────────┐
-  │                                             │
-  ├─ 1. 检查所有活跃订单状态（一次性）            │
-  │     └─ 有成交 → 定位所属市场，更新持仓        │
-  ├─ 2. 遍历每个市场:                            │
-  │     ├─ 拉取 order book, 得到 mid             │
-  │     ├─ 计算 fair_value (s):                  │
-  │     │   默认 s=mid, 有外部数据时加权平均      │
-  │     ├─ 更新波动率 σ (滑动窗口)               │
-  │     ├─ 更新订单到达强度 k                    │
-  │     ├─ 读取库存 q                            │
-  │     ├─ AS 计算:                              │
-  │     │   r = s - q * γ * σ² * (T-t)          │
-  │     │   δ = γ * σ² * (T-t) + (2/γ)*ln(1+γ/k)│
-  │     │   δ = max(δ, min_spread)               │
-  │     │   bid = r - δ/2,  ask = r + δ/2       │
-  │     ├─ 库存超限检查:                         │
-  │     │   q > max → 只挂 ask                   │
-  │     │   q < -max → 只挂 bid                  │
-  │     ├─ 需要重新报价?                         │
-  │     │   ├─ YES → 撤旧单，挂新单              │
-  │     │   └─ NO  → 跳过                       │
-  │     └─ (下一个市场)                          │
-  ├─ 3. 到 PnL 报告时间? → 输出各市场报告        │
-  ├─ 4. sleep(poll_interval)                    │
-  └─────────────────────────────────────────────┘
+=== 进程 A: 行情服务 (poly_md) ===
 
-退出信号 (Ctrl+C)
-  │
-  ├─ 撤销所有市场的活跃订单
-  ├─ 输出 per-market PnL + portfolio 总敞口
-  └─ 退出
+启动
+  ├─ 创建共享内存 /poly_md
+  ├─ 连接 WebSocket, 订阅 tokens
+  ▼
+行情循环 ──────────────────────────────┐
+  ├─ 收到 WS 消息                      │
+  ├─ 解析 → 写入 slot (seqlock)        │
+  ├─ 更新 heartbeat                    │
+  └────────────────────────────────────┘
+
+
+=== 进程 B: 策略 + 执行 (mm_bot) ===
+
+启动
+  ├─ 打开共享内存 /poly_md (只读)
+  ├─ 验证 heartbeat (行情服务存活?)
+  ├─ 初始化 API 连接, 验证余额
+  ▼
+策略循环 ────────────────────────────────────────┐
+  │                                              │
+  ├─ 1. 检查所有活跃订单状态                       │
+  │     └─ 有成交 → 定位所属市场，更新持仓          │
+  ├─ 2. 遍历每个市场:                              │
+  │     ├─ 读共享内存 slot (seqlock, <100ns)       │
+  │     ├─ 计算 fair_value (s)                     │
+  │     ├─ 更新 σ, k                               │
+  │     ├─ AS: r = s - qγσ²τ,  δ = γσ²τ + ...     │
+  │     ├─ 库存超限 → 单边报价                      │
+  │     ├─ 需要 requote? → 撤旧单，挂新单          │
+  │     └─ (下一个市场)                             │
+  ├─ 3. PnL 报告                                   │
+  ├─ 4. sleep(poll_interval)                       │
+  └──────────────────────────────────────────────┘
 ```
 
 ---
