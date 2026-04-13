@@ -26,8 +26,8 @@ struct MarketState {
 
     std::unique_ptr<PnlReporter> reporter;
 
-    explicit MarketState(const std::string& tid, size_t vol_window = 100)
-        : token_id(tid), vol_tracker(vol_window) {
+    explicit MarketState(const std::string& tid, int vol_window_s = 3600)
+        : token_id(tid), vol_tracker(vol_window_s) {
         reporter = std::make_unique<PnlReporter>(position);
     }
 

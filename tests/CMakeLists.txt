@@ -24,6 +24,7 @@ add_mm_test(test_config            unit/test_config.cpp)
 add_mm_test(test_fair_value        unit/test_fair_value.cpp)
 add_mm_test(test_volatility        unit/test_volatility.cpp)
 add_mm_test(test_as_model          unit/test_as_model.cpp)
+add_mm_test(test_shm               unit/test_shm.cpp)
 
 # Integration tests
 add_mm_test(test_order_manager     integration/test_order_manager.cpp)

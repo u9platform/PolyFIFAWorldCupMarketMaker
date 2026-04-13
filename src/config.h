@@ -21,7 +21,7 @@ struct Config {
     // AS model params
     double gamma = 0.1;
     double min_spread = 0.001;
-    int vol_window_size = 100;
+    int vol_window_size = 3600;   // seconds (1 hour)
     double max_inventory = 1000;
     std::string expiry_date = "2026-07-20";
     int poll_interval_ms = 10000;

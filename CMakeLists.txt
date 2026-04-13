@@ -45,14 +45,19 @@ add_library(mm_core STATIC
     src/ws_market_feed.cpp
     src/fair_value.cpp
     src/volatility_tracker.cpp
+    src/market_data_writer.cpp
+    src/market_data_reader.cpp
 )
 
 target_include_directories(mm_core PUBLIC src)
 target_link_libraries(mm_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog CURL::libcurl ixwebsocket::ixwebsocket)
 
-# Main executable
+# Main executables
 add_executable(mm_bot src/main.cpp)
 target_link_libraries(mm_bot PRIVATE mm_core)
+
+add_executable(poly_md src/poly_md_main.cpp)
+target_link_libraries(poly_md PRIVATE mm_core)
 
 # Tests
 enable_testing()

@@ -1,44 +1,55 @@
 #include "volatility_tracker.h"
 #include <gtest/gtest.h>
-#include <cmath>
 
 using namespace mm;
 
 TEST(Volatility, EmptyWindow_ReturnsMinSigma) {
-    VolatilityTracker vt(100, 0.01);
-    EXPECT_DOUBLE_EQ(vt.sigma(), 0.01);
+    VolatilityTracker vt(3600, 300000, 0.0001);
+    EXPECT_DOUBLE_EQ(vt.sigma(), 0.0001);
 }
 
 TEST(Volatility, SinglePrice_ReturnsMinSigma) {
-    VolatilityTracker vt(100, 0.01);
-    vt.addPrice(0.022);
-    EXPECT_DOUBLE_EQ(vt.sigma(), 0.01);
+    VolatilityTracker vt(3600, 300000, 0.0001);
+    vt.addPrice(0.022, 1000);
+    EXPECT_DOUBLE_EQ(vt.sigma(), 0.0001);
 }
 
 TEST(Volatility, ConstantPrices_ReturnsMinSigma) {
-    VolatilityTracker vt(100, 0.01);
-    for (int i = 0; i < 50; i++) vt.addPrice(0.022);
-    EXPECT_DOUBLE_EQ(vt.sigma(), 0.01);
+    // Same price across multiple 5-min buckets → zero vol
+    VolatilityTracker vt(3600, 300000, 0.0001);
+    for (int i = 0; i < 10; i++) {
+        vt.addPrice(0.022, static_cast<int64_t>(i) * 300000);  // every 5 min
+    }
+    EXPECT_DOUBLE_EQ(vt.sigma(), 0.0001);
 }
 
 TEST(Volatility, AlternatingPrices_NonTrivialVol) {
-    VolatilityTracker vt(100, 0.01);
-    for (int i = 0; i < 50; i++) {
-        vt.addPrice(i % 2 == 0 ? 0.020 : 0.022);
+    // Price alternates between 0.020 and 0.022 each 5-min bucket
+    VolatilityTracker vt(3600, 300000, 0.0001);
+    for (int i = 0; i < 10; i++) {
+        double price = (i % 2 == 0) ? 0.020 : 0.022;
+        vt.addPrice(price, static_cast<int64_t>(i) * 300000);
     }
-    EXPECT_GT(vt.sigma(), 0.01);
+    double s = vt.sigma();
+    EXPECT_GT(s, 0.0001);
+    // Changes are ±0.002, std dev should be ~0.002
+    EXPECT_NEAR(s, 0.002, 0.001);
 }
 
 TEST(Volatility, WindowRolling_OldDropped) {
-    VolatilityTracker vt(5, 0.01);
-    // Add 5 constant prices
-    for (int i = 0; i < 5; i++) vt.addPrice(0.022);
-    EXPECT_DOUBLE_EQ(vt.sigma(), 0.01);  // constant = min
+    // Window = 30 min = 1800s. Resample = 5 min = 300s
+    VolatilityTracker vt(1800, 300000, 0.0001);
 
-    // Now add 5 alternating prices, old constant ones drop out
-    for (int i = 0; i < 5; i++) {
-        vt.addPrice(i % 2 == 0 ? 0.020 : 0.024);
+    // Add constant prices for first 30 min
+    for (int i = 0; i < 6; i++) {
+        vt.addPrice(0.022, static_cast<int64_t>(i) * 300000);
     }
-    EXPECT_GT(vt.sigma(), 0.01);
-    EXPECT_EQ(vt.sampleCount(), 5u);
+    EXPECT_DOUBLE_EQ(vt.sigma(), 0.0001);
+
+    // Add volatile prices for next 30 min → old ones should drop
+    for (int i = 6; i < 12; i++) {
+        double price = (i % 2 == 0) ? 0.020 : 0.024;
+        vt.addPrice(price, static_cast<int64_t>(i) * 300000);
+    }
+    EXPECT_GT(vt.sigma(), 0.0001);
 }

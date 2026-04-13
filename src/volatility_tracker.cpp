@@ -1,58 +1,64 @@
 #include "volatility_tracker.h"
+#include "types.h"
 #include <cmath>
 #include <numeric>
 #include <vector>
+#include <map>
 
 namespace mm {
 
-VolatilityTracker::VolatilityTracker(size_t window_size, double min_sigma)
-    : window_size_(window_size), min_sigma_(min_sigma) {}
+VolatilityTracker::VolatilityTracker(int window_seconds, int resample_ms, double min_sigma)
+    : window_seconds_(window_seconds), resample_ms_(resample_ms), min_sigma_(min_sigma) {}
 
 void VolatilityTracker::addPrice(double price) {
+    addPrice(price, nowMs());
+}
+
+void VolatilityTracker::addPrice(double price, int64_t timestamp_ms) {
     if (price <= 0) return;
-    prices_.push_back(price);
-    if (prices_.size() > window_size_) {
-        prices_.pop_front();
+    raw_.push_back({timestamp_ms, price});
+
+    // Trim old samples outside window
+    int64_t cutoff = timestamp_ms - static_cast<int64_t>(window_seconds_) * 1000;
+    while (!raw_.empty() && raw_.front().ts < cutoff) {
+        raw_.pop_front();
     }
 }
 
 double VolatilityTracker::sigma() const {
-    if (prices_.size() < 2) return min_sigma_;
+    if (raw_.size() < 2) return min_sigma_;
 
-    // Compute log returns
-    std::vector<double> returns;
-    returns.reserve(prices_.size() - 1);
-    for (size_t i = 1; i < prices_.size(); ++i) {
-        if (prices_[i - 1] > 0 && prices_[i] > 0) {
-            returns.push_back(std::log(prices_[i] / prices_[i - 1]));
-        }
+    // Resample: take last price in each bucket
+    std::map<int64_t, double> buckets;
+    for (auto& s : raw_) {
+        int64_t bucket = s.ts / resample_ms_;
+        buckets[bucket] = s.price;  // last price wins
     }
 
-    if (returns.empty()) return min_sigma_;
+    if (buckets.size() < 2) return min_sigma_;
 
-    // Mean
-    double mean = std::accumulate(returns.begin(), returns.end(), 0.0) / returns.size();
+    // Compute absolute price changes between consecutive buckets
+    std::vector<double> changes;
+    auto it = buckets.begin();
+    double prev_price = it->second;
+    ++it;
+    for (; it != buckets.end(); ++it) {
+        changes.push_back(it->second - prev_price);
+        prev_price = it->second;
+    }
 
-    // Variance
+    if (changes.empty()) return min_sigma_;
+
+    // Standard deviation of absolute changes
+    double mean = std::accumulate(changes.begin(), changes.end(), 0.0) / changes.size();
     double var = 0;
-    for (double r : returns) {
-        double d = r - mean;
+    for (double c : changes) {
+        double d = c - mean;
         var += d * d;
     }
-    var /= returns.size();
+    var /= changes.size();
 
-    double std_dev = std::sqrt(var);
-
-    // Annualize: assume each sample is ~5 seconds apart (poll interval),
-    // so samples_per_year ≈ 365.25 * 24 * 3600 / 5 ≈ 6,311,520
-    // But this gives absurdly high annualized vol for low-freq data.
-    // Better: just return the per-sample std_dev, let gamma handle scaling.
-    // The AS formula uses σ² * (T-t) where T-t is in years,
-    // so σ should be annualized. We use sqrt(samples_per_year) scaling.
-    constexpr double SAMPLES_PER_YEAR = 365.25 * 24 * 3600 / 5.0;
-    double annualized = std_dev * std::sqrt(SAMPLES_PER_YEAR);
-
-    return std::max(annualized, min_sigma_);
+    return std::max(std::sqrt(var), min_sigma_);
 }
 
 } // namespace mm
